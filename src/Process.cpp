@@ -134,7 +134,7 @@ Vertex * Process::vertex_on_rhs( const active & x )
     }
   }
   
-  return NULL;
+  return nullptr;
 }
 
 Vertex * Process::vertex_on_lhs( const active & x )
@@ -153,7 +153,7 @@ Vertex * Process::vertex_on_lhs( const active & x )
     return vPtr;
   }
 
-  return NULL;
+  return nullptr;
 }
 
 Vertex * Process::set_vertex_dead( const active & x )
@@ -163,7 +163,7 @@ Vertex * Process::set_vertex_dead( const active & x )
       if(x.vtx){
         Vertex * vPtr = x.vtx;
         x.idx = 0;
-        x.vtx = NULL;
+        x.vtx = nullptr;
         return vPtr;
       }else{
         Vertex * vPtr = new Vertex( x.idx , x.owner_idx ); 
@@ -174,7 +174,7 @@ Vertex * Process::set_vertex_dead( const active & x )
 
         intmed_vec.push_back(vPtr);//add new vertex
         x.idx = 0;
-        x.vtx = NULL;
+        x.vtx = nullptr;
         return vPtr;
 
       }//end of x.vtx
@@ -182,8 +182,8 @@ Vertex * Process::set_vertex_dead( const active & x )
   }//end of is_proc()
 
   x.idx = 0;//reset idx to 0
-  x.vtx = NULL;//reset vtx to NULL
-  return NULL;
+  x.vtx = nullptr;//reset vtx to nullptr
+  return nullptr;
 }
 
 Vertex * Process::set_vertex_dead_binary_op_ass( const active & x )
@@ -192,7 +192,7 @@ Vertex * Process::set_vertex_dead_binary_op_ass( const active & x )
     if(x.idx){ 
       if(x.vtx){
         Vertex * vPtr = x.vtx;
-        x.vtx = NULL;
+        x.vtx = nullptr;
         return vPtr;
       }else{
         Vertex * vPtr = new Vertex( x.idx , x.owner_idx ); 
@@ -202,14 +202,14 @@ Vertex * Process::set_vertex_dead_binary_op_ass( const active & x )
         }
 
         intmed_vec.push_back(vPtr);//add new vertex
-        x.vtx = NULL;
+        x.vtx = nullptr;
         return vPtr;
       }
     }
   }
 
-  x.vtx = NULL;//reset vtx to NULL
-  return NULL;
+  x.vtx = nullptr;//reset vtx to nullptr
+  return nullptr;
 }
 
 bool Process::is_proc()
@@ -264,7 +264,7 @@ void Process::check_memory()
          * before reinitialize() resets them.  Every partition after this one
          * therefore executes exactly as the ones BEFORE the target already do
          * on every pass: the counters advance so the boundaries stay put,
-         * vertex_on_lhs() returns NULL, and nothing is allocated.  The first
+         * vertex_on_lhs() returns nullptr, and nothing is allocated.  The first
          * productive pass has always ended this way -- reinitialize() leaves
          * throwable false for it -- so the no-throw ending is the older of the
          * two, not the new one.
@@ -428,7 +428,7 @@ void Process::register_dep_vertex( const active & x )
         this->dep_vec.push_back(vPtr);
         this->intmed_map.insert(std::pair<largeint,Vertex*>( vPtr->idx , vPtr ) );
       }else{
-        this->dep_vec.push_back(NULL);
+        this->dep_vec.push_back(nullptr);
       } 
 
     }
@@ -448,13 +448,13 @@ void Process::unary_op( const active & x1 ,  double dy_dx1 , const active & x2 ,
   }else{
     /*
      * SVEGP-20 : these were left uninitialised.  add_edge() only guards against
-     * NULL, so an indeterminate non-null value walks straight into
+     * nullptr, so an indeterminate non-null value walks straight into
      * tgt->add_in_edge(src,...).  The library's own callers always set the
      * reachability flags consistently, but unary_op/binary_op/postfix_op are
      * exported in API.hpp for hand-written operators, and there a mismatched
      * flag turns into a wild pointer dereference instead of a dropped edge.
      */
-    Vertex * v1=NULL, * v2=NULL;
+    Vertex * v1=nullptr, * v2=nullptr;
 
     if(overwrite){
       set_vertex_dead(x2);
@@ -496,7 +496,7 @@ void Process::binary_op(  const active & x1 , double dy_dx1 , const active & x2 
       }
     }
   }else{
-    Vertex * v1=NULL , * v2=NULL , * v3=NULL;//SVEGP-20
+    Vertex * v1=nullptr , * v2=nullptr , * v3=nullptr;//SVEGP-20
 
     if(x3.reachable){
       if(x1.reachable){
@@ -545,7 +545,7 @@ void Process::unary_op_ass( double dy_dx , const active & x )
       x.idx = 0;
     }
   }else{
-    Vertex * v1=NULL, * v2=NULL;//SVEGP-20
+    Vertex * v1=nullptr, * v2=nullptr;//SVEGP-20
     v1 = set_vertex_dead(x);//x = x op a , extract x.vtx and save it in v1
     x.owner_idx = next_owner_idx;
 
@@ -583,8 +583,8 @@ void Process::binary_op_ass( const active & x1 , double dy_dx1 , const active & 
       x2.idx = 0;
     }
   }else{
-    Vertex *v1=NULL, *v2=NULL, *v3=NULL;//SVEGP-20
-    v2 = set_vertex_dead_binary_op_ass(x2);//v2 could be NULL
+    Vertex *v1=nullptr, *v2=nullptr, *v3=nullptr;//SVEGP-20
+    v2 = set_vertex_dead_binary_op_ass(x2);//v2 could be nullptr
     largeint old_x2_idx = x2.idx;//save x2.idx before it gets overwritten
     x2.owner_idx = next_owner_idx;
 
@@ -627,7 +627,7 @@ void Process::postfix_op( const active & x1 , const active & x2 )
       x2.idx = 0;
     }
   }else{
-    Vertex * v1=NULL, * v2=NULL;//SVEGP-20
+    Vertex * v1=nullptr, * v2=nullptr;//SVEGP-20
 
     if(x1.reachable){
       v1 = vertex_on_rhs(x1);
@@ -844,7 +844,7 @@ largeint Process::reverse_eliminate()
 
 void Process::harvest( largeint m , largeint n ,  double **& A , bool print_out )//default : print_out = true (see Process.hpp)
 {
-  A = NULL;//SVEGP-04: never leave the caller's pointer untouched
+  A = nullptr;//SVEGP-04: never leave the caller's pointer untouched
 
   /*
    * SVEGP-04 : harvest() used to do nothing at all while still profiling, leaving

@@ -295,7 +295,7 @@ int main( int argc , char ** argv )
    * tape each piece is short and the forward/reverse gap collapses.  The
    * deep-tape penalty is a property of the whole lattice.
    */
-  const largeint MEM_CHUNK = (argc>4) ? (largeint)std::strtoul(argv[4],NULL,10) : 200000;
+  const largeint MEM_CHUNK = (argc>4) ? (largeint)std::strtoul(argv[4],nullptr,10) : 200000;
   const largeint MEM_WHOLE = 1000000000UL;
 
   int failures = 0;
@@ -316,7 +316,7 @@ int main( int argc , char ** argv )
 
   for( int i=0 ; i<=NX ; i++ ) u0true[i] = truth(double(i)*dx());
   u0true[0] = 0.0; u0true[NX] = 0.0;
-  march_passive(&u0true[0],&obs[0],NULL);
+  march_passive(&u0true[0],&obs[0],nullptr);
 
   //first guess: a flat, wrong field
   for( int i=0 ; i<NP ; i++ ) w[i] = 0.0;

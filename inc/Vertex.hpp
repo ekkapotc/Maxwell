@@ -147,7 +147,7 @@ class Adjacency
 
 private:
 
-  AdjEntry * a;     //arena block, or NULL while empty
+  AdjEntry * a;     //arena block, or nullptr while empty
   largeint   n;     //entries in use
   largeint   cap;   //entries the block holds
 
@@ -155,7 +155,7 @@ public:
 
   typedef AdjEntry * iterator;
 
-  Adjacency(): a(NULL), n(0), cap(0) {}
+  Adjacency(): a(nullptr), n(0), cap(0) {}
 
   iterator begin(){ return a; }
 
@@ -234,7 +234,7 @@ public:
   void clear( AdjArena & arena )
   {
     if(a) arena.release(a,cap);
-    a   = NULL;
+    a   = nullptr;
     n   = 0;
     cap = 0;
   }

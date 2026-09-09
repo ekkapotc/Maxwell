@@ -98,7 +98,7 @@ int main( int argc , char ** argv )
    * old multiplier would otherwise be a one-byte budget, which chunks on every
    * single operation and looks like a hang rather than a mistake.
    */
-  const largeint mem = (largeint)std::strtoul(argv[3],NULL,10);
+  const largeint mem = (largeint)std::strtoul(argv[3],nullptr,10);
 
   if( mem < 4096 ){
     std::fprintf(stderr,

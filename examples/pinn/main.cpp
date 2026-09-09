@@ -283,7 +283,7 @@ int main( int argc , char ** argv )
    * the partition count.
    */
   const largeint MEM_LOOSE = 400000000;
-  const largeint MEM_TRAIN = (argc>4) ? (largeint)std::strtoul(argv[4],NULL,10) : 900000;
+  const largeint MEM_TRAIN = (argc>4) ? (largeint)std::strtoul(argv[4],nullptr,10) : 900000;
 
   std::printf("Spring-mass PINN via Maxwell reverse-mode AD\n");
   std::printf("=========================================\n");

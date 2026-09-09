@@ -190,7 +190,7 @@ int main( int argc , char ** argv )
   const int epochs = (argc>1) ? std::atoi(argv[1]) : 4000;
   NH               = (argc>2) ? std::atoi(argv[2]) : 4;
   rng_state        = (argc>3) ? (unsigned long long)std::atoi(argv[3]) : 1;
-  const largeint mem = (argc>4) ? (largeint)std::strtoul(argv[4],NULL,10) : 3000;
+  const largeint mem = (argc>4) ? (largeint)std::strtoul(argv[4],nullptr,10) : 3000;
 
   NP = 4*NH + 1;
 

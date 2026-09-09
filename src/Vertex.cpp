@@ -15,7 +15,7 @@ slab_max(SLAB_CAP),
 entries(0)
 {
   for( largeint c=0 ; c<NCLASS ; c++ ){
-    cursor[c]    = NULL;
+    cursor[c]    = nullptr;
     left[c]      = 0;
     next_slab[c] = 0;
   }
@@ -142,7 +142,7 @@ void AdjArena::clear()
 
   for( largeint c=0 ; c<NCLASS ; c++ ){
     recycled[c].clear();
-    cursor[c]    = NULL;
+    cursor[c]    = nullptr;
     left[c]      = 0;
     next_slab[c] = 0;
   }
@@ -193,7 +193,7 @@ Edge * Vertex::from( Vertex * src )
   if(it!=in_edges.end()){
     return it->second;
   }
-  return NULL;
+  return nullptr;
 }
 
 Edge * Vertex::add_in_edge( Vertex * src , double eval , EdgeArena & arena , AdjArena & adj )
@@ -224,7 +224,7 @@ largeint Vertex::eliminate( EdgeArena & arena , AdjArena & adj )
     {
       double cij = (inedge_it->second->eval)*(outedge_it->second->eval);
 
-      Edge * direct_link = NULL;
+      Edge * direct_link = nullptr;
 
       Adjacency::iterator direct_link_it;
 

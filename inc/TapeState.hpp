@@ -89,7 +89,7 @@ public:
    *               which examples/invariants does -- enters a second scope on a
    *               tape that is already current, and a single slot would
    *               overwrite the real predecessor with the tape itself.  Leaving
-   *               the outer scope would then put back the WRONG tape: NULL
+   *               the outer scope would then put back the WRONG tape: nullptr
    *               rather than whatever was current, so an ENCLOSING tape's
    *               section would go on recording onto nothing and harvest a
    *               silently wrong Jacobian.  Only the outermost enter/leave pair
@@ -127,7 +127,7 @@ private:
 };//end of class
 
 /*
- * The tape the free-function API is recording onto, or NULL if there is none.
+ * The tape the free-function API is recording onto, or nullptr if there is none.
  * thread_local: initialize() sets it, finalize() clears it, and every entry
  * point in API.cpp goes through it instead of through a file-static.
  */

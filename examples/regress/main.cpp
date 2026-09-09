@@ -162,9 +162,9 @@ static void t_no_tape()
   report("forward_elimination() with no tape", forward_elimination()==0);
   report("reverse_elimination() with no tape", reverse_elimination()==0);
 
-  double ** A = NULL;
+  double ** A = nullptr;
   harvest(1,1,A);
-  report("harvest() with no tape leaves A null", A==NULL);
+  report("harvest() with no tape leaves A null", A==nullptr);
   harvest(1,1,A,false);
   free_jacobian(1,A);
 
@@ -269,7 +269,7 @@ static void t_two_tapes()
     set_current_tape(&A);
     dependent(ya);
     pA = get_partitions();
-    double ** JA = NULL;
+    double ** JA = nullptr;
     harvest(1,2,JA,false);
     dA = JA ? JA[0][0] : NAN;
     free_jacobian(1,JA);
@@ -277,7 +277,7 @@ static void t_two_tapes()
     set_current_tape(&B);
     dependent(yb);
     pB = get_partitions();
-    double ** JB = NULL;
+    double ** JB = nullptr;
     harvest(1,2,JB,false);
     dB = JB ? JB[0][0] : NAN;
     free_jacobian(1,JB);
@@ -289,7 +289,7 @@ static void t_two_tapes()
      * ~Tape() gives each graph back (SVEGP-27), which is what makes this block
      * clean under LeakSanitizer.
      */
-    set_current_tape(NULL);
+    set_current_tape(nullptr);
   }
 
   const double wA = exact_dsin_dx0(a1,b1);
@@ -352,7 +352,7 @@ static double dsin_dx0( double a , double b )
 
   dependent(y);
 
-  double ** A = NULL;
+  double ** A = nullptr;
   harvest(1,2,A,false);
   double d = A ? A[0][0] : NAN;
   free_jacobian(1,A);
@@ -423,7 +423,7 @@ static void t_grid2d()
 
   for(int i=0;i<NY;i++) for(int j=0;j<NX;j++) dependent(y[i][j]);
 
-  double ** A = NULL;
+  double ** A = nullptr;
   harvest(N,N,A,false);
 
   int bad = 0;
@@ -470,7 +470,7 @@ static void jac( unsigned long budget , double * out , unsigned long * cost , in
   else if(elim_mode==2) *cost = reverse_elimination();
   else                  *cost = get_cost();
 
-  double ** A = NULL;
+  double ** A = nullptr;
   harvest(M,N,A,false);
   for(int r=0;r<M;r++) for(int c=0;c<N;c++) out[r*N+c] = A ? A[r][c] : NAN;
   free_jacobian(M,A);
@@ -663,7 +663,7 @@ static void t_raii()
   }
 
   /* ---- 4. the scopes nest, which is what lets Tape objects coexist */
-  report("no tape is current between Tape scopes", current_tape()==NULL);
+  report("no tape is current between Tape scopes", current_tape()==nullptr);
 
   {
     /*
@@ -722,7 +722,7 @@ static void t_raii()
      * examples/invariants does, to weigh the graph against the budget while it
      * is being built -- enters a second scope on a tape that is already
      * current.  A single saved-tape slot would be overwritten with the tape
-     * itself, and leaving the OUTER scope would then restore NULL instead of
+     * itself, and leaving the OUTER scope would then restore nullptr instead of
      * the enclosing tape.  Nothing would report it: the enclosing section would
      * simply carry on recording onto no tape at all and harvest a wrong
      * Jacobian.  Hence the scope depth counter, and hence this case, which the
@@ -781,7 +781,7 @@ static void t_raii()
     }
 
     report("a throw out of the section still unwinds", threw);
-    report("...and ~Tape() still closed the tape", current_tape()==NULL);
+    report("...and ~Tape() still closed the tape", current_tape()==nullptr);
   }
 
   /* ---- 5. the two surfaces cannot be mixed into a use-after-free */

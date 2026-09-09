@@ -40,7 +40,7 @@ namespace maxwell
 namespace internals
 {
 
-static thread_local TapeState * g_current_tape = NULL;
+static thread_local TapeState * g_current_tape = nullptr;
 
 TapeState * current_tape()
 {
@@ -65,7 +65,7 @@ run_counter(0),
 indep_shadow_copy(new double[n]),
 dep_shadow_copy(new double[m]),
 owned(false),//SVEGP-28
-saved(NULL),
+saved(nullptr),
 scope_depth(0),
 indep_rows_n(0),
 indep_cols_n(0),
@@ -120,7 +120,7 @@ void maxwell::initialize( largeint independent_size , largeint dependent_size , 
 
   if(open){
     std::cerr << "maxwell::initialize: a tape was already open -- closing it first.\n";
-    set_current_tape(NULL);
+    set_current_tape(nullptr);
     delete open;
   }
 
@@ -150,7 +150,7 @@ void maxwell::finalize()
 
   t->proc.finalize();
 
-  set_current_tape(NULL);
+  set_current_tape(nullptr);
 
   delete t;
 }
@@ -168,7 +168,7 @@ void maxwell::finalize()
 void maxwell::independent( const active & x )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(!myProc){
     std::cerr << "maxwell::independent: called before initialize() -- ignored.\n";
     return;
@@ -189,7 +189,7 @@ void maxwell::independent( const active & x )
 void maxwell::dependent( const active & x )
 {	
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(!myProc){
     std::cerr << "maxwell::dependent: called before initialize() -- ignored.\n";
     return;
@@ -201,7 +201,7 @@ void maxwell::dependent( const active & x )
 void maxwell::unary_op( const active & x1 ,  double dy_dx1 , const active & x2 , bool overwrite )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->unary_op(x1,dy_dx1,x2,overwrite);
   }
@@ -210,7 +210,7 @@ void maxwell::unary_op( const active & x1 ,  double dy_dx1 , const active & x2 ,
 void maxwell::binary_op( const active & x1 , double dy_dx1 , const active & x2 , double dy_dx2  , const active & x3 )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->binary_op(x1,dy_dx1,x2,dy_dx2,x3);
   }
@@ -219,7 +219,7 @@ void maxwell::binary_op( const active & x1 , double dy_dx1 , const active & x2 ,
 void maxwell::unary_op_ass( double dy_dx , const active & x )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->unary_op_ass(dy_dx,x); 
   }
@@ -228,7 +228,7 @@ void maxwell::unary_op_ass( double dy_dx , const active & x )
 void maxwell::binary_op_ass( const active & x1 , double dy_dx1 , const active & x2, double dy_dx2 )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->binary_op_ass(x1,dy_dx1,x2,dy_dx2);
   }
@@ -237,7 +237,7 @@ void maxwell::binary_op_ass( const active & x1 , double dy_dx1 , const active & 
 void maxwell::postfix_op( const active & x1 , const active & x2 )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->postfix_op(x1,x2);
   }
@@ -246,7 +246,7 @@ void maxwell::postfix_op( const active & x1 , const active & x2 )
 void maxwell::passive_op( const active & x )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->passive_op(x);
   }
@@ -255,7 +255,7 @@ void maxwell::passive_op( const active & x )
 void maxwell::destructor( const active & x )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->destructor(x,false);
   }
@@ -272,7 +272,7 @@ void maxwell::destructor( const active & x )
 largeint maxwell::forward_elimination()
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     return myProc->forward_eliminate();
   }
@@ -282,7 +282,7 @@ largeint maxwell::forward_elimination()
 largeint maxwell::reverse_elimination()
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     return myProc->reverse_eliminate();
   }
@@ -292,8 +292,8 @@ largeint maxwell::reverse_elimination()
 void maxwell::harvest( largeint m , largeint n ,  double **& A )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
-  A = NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
+  A = nullptr;
 
   if(myProc){
     myProc->harvest(m,n,A);
@@ -304,8 +304,8 @@ void maxwell::harvest( largeint m , largeint n ,  double **& A )
 void maxwell::harvest( largeint m , largeint n ,  double **& A , bool print_out )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
-  A = NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
+  A = nullptr;
 
   if(myProc){
     myProc->harvest(m,n,A,print_out);
@@ -321,14 +321,14 @@ void maxwell::free_jacobian( largeint m , double **& A )
 
   delete [] A;
 
-  A = NULL;
+  A = nullptr;
 }
 
 double maxwell::get_wall_time()
 {
   struct timeval time;
 
-  if(gettimeofday(&time,NULL)){
+  if(gettimeofday(&time,nullptr)){
     return 0;
   }
 
@@ -343,7 +343,7 @@ double maxwell::get_cpu_time()
 largeint maxwell::get_cost()
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     return myProc->get_cost();
   }
@@ -355,7 +355,7 @@ largeint maxwell::get_cost()
 void maxwell::set_elim_mode( elim_t mode )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->set_elim_mode(mode);
   }
@@ -365,7 +365,7 @@ void maxwell::set_elim_mode( elim_t mode )
 void maxwell::set_break_mode( break_t mode )
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     myProc->set_break_mode(mode);
   }
@@ -385,7 +385,7 @@ largeint maxwell::get_partitions()
 largeint maxwell::get_memory()
 {
   TapeState * tp = current_tape();
-  Process * myProc = tp ? &tp->proc : NULL;
+  Process * myProc = tp ? &tp->proc : nullptr;
   if(myProc){
     return myProc->get_memory();
   }
@@ -609,14 +609,14 @@ void maxwell::internals::restore_values( active * x , active & y )
   y.idx = 0;
   y.owner_idx = 0;
   y.val = 0.0;
-  y.vtx = NULL;
+  y.vtx = nullptr;
 
   for( largeint i=0 ; i<tp->independent_size ; i++ ){
     x[i].reachable = true;
     x[i].idx = i+1;
     x[i].owner_idx = 0;
     x[i].val = tp->indep_shadow_copy[i];
-    x[i].vtx = NULL;
+    x[i].vtx = nullptr;
   }
 }
 
@@ -632,7 +632,7 @@ void maxwell::internals::restore_values( active * x , active * y )
       y[i].idx = 0;
       y[i].owner_idx = 0;
       y[i].val = 0.0;
-      y[i].vtx = NULL;
+      y[i].vtx = nullptr;
     }
   }
 
@@ -641,7 +641,7 @@ void maxwell::internals::restore_values( active * x , active * y )
     x[i].idx = i+1;
     x[i].owner_idx = 0;
     x[i].val = tp->indep_shadow_copy[i];
-    x[i].vtx = NULL;
+    x[i].vtx = nullptr;
   }
 }
 
@@ -656,7 +656,7 @@ void maxwell::internals::restore_values( active ** x , active ** y )
       y[i][j].idx = 0;
       y[i][j].owner_idx = 0;
       y[i][j].val = 0.0;
-      y[i][j].vtx = NULL;
+      y[i][j].vtx = nullptr;
     }
   }
 
@@ -672,7 +672,7 @@ void maxwell::internals::restore_values( active ** x , active ** y )
       x[i][j].idx = tp->indep_x_dim*i+j+1;//indices start from 1
       x[i][j].owner_idx = 0;
       x[i][j].val = tp->indep_shadow_copy[tp->indep_x_dim*i+j];
-      x[i][j].vtx = NULL;
+      x[i][j].vtx = nullptr;
     }
   }
 }
@@ -740,7 +740,7 @@ maxwell::Tape::~Tape()
  * Only the OUTERMOST scope records what to put back.  A Tape member called from
  * inside that same Tape's run() -- examples/invariants reads t.memory() while
  * recording -- would otherwise overwrite the real predecessor with this tape,
- * and leaving the outer scope would restore NULL instead of the enclosing tape.
+ * and leaving the outer scope would restore nullptr instead of the enclosing tape.
  * Nothing would say so: the enclosing section would simply go on recording onto
  * no tape and harvest a wrong Jacobian.
  */
@@ -762,17 +762,17 @@ void maxwell::Tape::leave_()
   if( st_->scope_depth ) return;//still inside an outer scope on this tape
 
   internals::set_current_tape( st_->saved );
-  st_->saved = NULL;
+  st_->saved = nullptr;
 }
 
 active * maxwell::Tape::indep_1d_()
 {
-  return st_->indep_cells.empty() ? NULL : &st_->indep_cells[0];
+  return st_->indep_cells.empty() ? nullptr : &st_->indep_cells[0];
 }
 
 active ** maxwell::Tape::indep_2d_()
 {
-  return st_->indep_rows.empty() ? NULL : &st_->indep_rows[0];
+  return st_->indep_rows.empty() ? nullptr : &st_->indep_rows[0];
 }
 
 bool maxwell::Tape::ready_1d_( const char * who )
@@ -838,7 +838,7 @@ active ** maxwell::Tape::independents( largeint rows , largeint cols , const dou
     std::cerr << "maxwell::Tape::independents: " << rows << "x" << cols
               << " is " << n << " values, but the tape was constructed for "
               << st_->independent_size << ".  Ignored.\n";
-    return NULL;
+    return nullptr;
   }
 
   st_->indep_cells.resize(n);
@@ -928,7 +928,7 @@ maxwell::Jacobian maxwell::Tape::harvest( bool print_out )
   const largeint m = st_->dependent_size;
   const largeint n = st_->independent_size;
 
-  double ** A = NULL;
+  double ** A = nullptr;
 
   maxwell::harvest(m,n,A,print_out);
 
