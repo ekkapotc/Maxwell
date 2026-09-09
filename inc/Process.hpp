@@ -21,6 +21,7 @@ private:
   AdjArena  adj_arena;//SVEGP-30 (4d)
 
   elim_t elim_mode;
+  break_t break_mode;//SVEGP-32
   bool profiling;
   bool throwable;
   //bool unwinding;
@@ -125,6 +126,9 @@ public:
   void destructor( const active & x , bool is_over );
   
   void set_elim_mode( elim_t mode );
+
+  //SVEGP-32: end a pass by throwing, or by running the section to completion
+  void set_break_mode( break_t mode );
 
   //eliminate in whichever direction set_elim_mode() selected
   largeint eliminate();

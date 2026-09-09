@@ -62,7 +62,28 @@ private:
   largeint slots;     //total slots across every block
   largeint live;      //slots currently handed out
 
-  static const largeint BLOCK = 8192;
+  /*
+   * SVEGP-31 : the block size follows the memory budget.
+   *
+   * It was a fixed 8192 slots, and that quietly put a floor under the whole
+   * checkpointing scheme: 8192 Edges is 196608 bytes claimed the instant the
+   * arena is touched, however small the chunk.  Measured on a tape whose
+   * budget was 200000 bytes, the peak was 516688 with a low-water of 409968 --
+   * so the chunk itself accounted for about 107 kB of movement and 410 kB was
+   * arena capacity and frontier that no budget could reach.  Tightening the
+   * budget from 200000 to 50000 bought only 517 kB -> 317 kB, because it was
+   * shrinking the small part.
+   *
+   * A chunk of `bytes` holds at most bytes/EDGE_BYTES edges, so that is what a
+   * block needs to cover.  BLOCK_MAX keeps the old value as a ceiling, so a
+   * large or absent budget behaves exactly as before; BLOCK_MIN stops a
+   * pathologically small budget turning the arena back into one malloc per
+   * edge, which is what the arena exists to remove.
+   */
+  static const largeint BLOCK_MAX = 8192;
+  static const largeint BLOCK_MIN = 64;
+
+  largeint block;//slots per block; set from the budget before anything is carved
 
   EdgeArena( const EdgeArena & );//an arena owns raw storage: not copyable
   EdgeArena & operator=( const EdgeArena & );
@@ -71,6 +92,15 @@ public:
 
   EdgeArena();
   ~EdgeArena();
+
+  /*
+   * Sized from the tape's per-partition budget by Process::initialize(),
+   * before a single edge exists.  Ignored once storage has been carved: the
+   * block size is only meaningful while blocks are still being made.
+   */
+  void set_budget( largeint bytes );
+
+  largeint block_slots() const;
 
   Edge * acquire( Vertex * src , Vertex * tgt , double eval );
 

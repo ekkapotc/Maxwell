@@ -1,0 +1,2256 @@
+\documentclass[11pt,a4paper]{report}
+
+\usepackage[margin=2.6cm]{geometry}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{microtype}
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{tikz}
+\usepackage{longtable}
+\usepackage[colorlinks=true,linkcolor=black,urlcolor=blue,citecolor=black]{hyperref}
+\usetikzlibrary{positioning,arrows.meta}
+
+% long \code{} tokens cannot hyphenate; let TeX stretch rather than overflow
+\setlength{\emergencystretch}{2.5em}
+
+\definecolor{kw}{RGB}{0,80,160}
+\definecolor{cmt}{RGB}{90,110,90}
+\definecolor{str}{RGB}{150,60,40}
+\definecolor{rule}{RGB}{200,200,200}
+\definecolor{shade}{RGB}{248,248,246}
+
+\lstset{
+  language=C++,
+  basicstyle=\ttfamily\small,
+  keywordstyle=\color{kw}\bfseries,
+  commentstyle=\color{cmt}\itshape,
+  stringstyle=\color{str},
+  numbers=none,
+  frame=single,
+  rulecolor=\color{rule},
+  backgroundcolor=\color{shade},
+  breaklines=true,
+  breakatwhitespace=true,
+  showstringspaces=false,
+  columns=fullflexible,
+  keepspaces=true,
+  captionpos=b,
+  xleftmargin=0pt,
+  framexleftmargin=3pt,
+  morekeywords={active,largeint,Tape,Jacobian,TapeState,Process,Vertex,Edge,
+                AdjEntry,AdjArena,Adjacency,EdgeArena,BreakException,elim_t,
+                thread_local,noexcept,override,nullptr}
+}
+
+\newcommand{\svegp}[1]{\textsc{svegp-#1}}
+\newcommand{\code}[1]{\texttt{#1}}
+
+\title{\vspace{-2cm}\Huge Maxwell\\[0.3cm]
+\Large Automatic Differentiation by Sparse Graph Vertex Elimination\\[0.6cm]
+\large Implementation Report and User Guide}
+\author{Software and Tools for Scientific Computing}
+\date{9 September 2026}
+
+\begin{document}
+
+\maketitle
+
+\begin{abstract}
+\noindent
+Maxwell is a C\texttt{++} operator-overloading library for automatic
+differentiation. It records a program's arithmetic as a directed acyclic graph
+and computes the Jacobian by \emph{vertex elimination} rather than by a forward
+or reverse sweep, which lets the elimination direction be chosen per problem
+and makes the cost of differentiation a property of the graph rather than of
+the traversal. Its distinguishing feature is \emph{checkpointing under a memory
+budget}: a tape too large to hold is broken into partitions, and the recorded
+section is replayed once per partition, so a deep computation can be
+differentiated in bounded memory. The partitioning is bit-exact --- the same
+Jacobian is produced at a 1\,GB budget and at a 1\,kB budget, to the last bit,
+with twelve pinned witnesses asserting it.
+
+This report documents the implementation and the reasoning behind it. Part~I is
+a maintainer's reference: the graph representation, the elimination core, the
+checkpoint protocol, the memory accounting, the tape object, the RAII surface,
+the two storage arenas, and what is and is not possible concurrently. Design
+choices are justified with the measurements that produced them, including
+several that were measured \emph{wrong} before they were measured right ---
+a memory model that under-reported by a factor of $2.44$, an arena whose first
+two parameter choices each made things worse, and a scope-restoration bug that
+only a constructed test could expose. Part~II is a user guide: how to drive the
+library, what the checkpoint contract requires of your code, how to choose a
+budget, and six worked use cases taken from the shipped examples.
+
+\vspace{0.4cm}
+\noindent
+All measurements were taken on GCC 13.3.0, \code{-O2}, x86-64, and are
+reproducible from the tree with \code{make test} and \code{make sanitize}.
+\end{abstract}
+
+\tableofcontents
+
+\part{Design and Implementation}
+
+\chapter{Introduction}
+
+\section{What the library does}
+
+Maxwell differentiates a C\texttt{++} program by overloading the arithmetic
+operators on a scalar type, \code{maxwell::active}. Where a program computes
+with \code{double}, it computes with \code{active} instead; each elementary
+operation appends a vertex and one or two edges to a graph whose edge weights
+are the local partial derivatives. Once the program has run, the Jacobian of
+the declared dependents with respect to the declared independents is obtained
+by eliminating every intermediate vertex from that graph.
+
+The public protocol, in its oldest form, is seven ordered steps:
+
+\begin{lstlisting}
+initialize(n,m,budget);
+  independent(x[i]) ...
+  while( checkpoint(x,y) ){ try{ f(); } catch(BreakException const&){} }
+  dependent(y[k]) ...
+  harvest(m,n,A);          // double**, caller-owned
+  free_jacobian(m,A);
+finalize();
+\end{lstlisting}
+
+\noindent
+Part~II describes the modern surface, in which a \code{Tape} object replaces
+\code{initialize}/\code{finalize}, owns the loop and its \code{try}/\code{catch},
+and returns the Jacobian as a value. The free functions above remain, are still
+public, and are what the object surface is built on --- Chapter~\ref{ch:raii}
+explains why they were kept rather than retired.
+
+\section{What makes it different}
+
+Two things.
+
+\paragraph{Vertex elimination, not a sweep.} Forward-mode and reverse-mode AD
+are the two extreme orderings of a more general operation: eliminating vertices
+from the linearised computational graph. Maxwell implements the general
+operation, so the direction is a setting (\code{set\_elim\_mode}) rather than a
+different code path. On a deep, narrow tape the difference is large and
+measurable: \code{examples/heat\_assim} reports $6\,835$ multiply--adds in
+reverse against $112\,102$ forward on the same graph, a ratio of $16.4\times$,
+for an identical Jacobian.
+
+\paragraph{Checkpointing under a byte budget.} This is the feature the rest of
+the design serves. The library is told how many bytes of graph it may hold. It
+runs the user's section once to \emph{profile} it, discovers how many partitions
+the budget implies, and then replays the section once per partition, recording
+only one partition at a time and eliminating each into the accumulating result.
+Deep time-stepping problems that would otherwise exhaust memory become
+tractable, and --- crucially --- the answer does not depend on the budget. The
+regression suite asserts this at seven budgets from 200\,000 down to 1\,000
+bytes with \emph{zero} deviation, not a tolerance.
+
+\section{A note on the listings}
+
+Code in this report is taken from the tree, not paraphrased. Listings are
+excerpted --- elisions are marked \code{...} --- and occasionally carry a
+short explanatory comment that is not in the source. Where a listing shows a
+defect it is labelled as such and the fixed form is given alongside. Every
+snippet was checked against the file it came from before this document was
+compiled.
+
+\section{Scope of this report}
+
+Chapter~\ref{ch:graph} covers the recording machinery and the graph
+representation. Chapter~\ref{ch:elim} covers elimination. Chapter~\ref{ch:ckpt}
+covers checkpointing and the contract it imposes on user code.
+Chapter~\ref{ch:mem} covers the memory accounting that the budget is spent
+against. Chapter~\ref{ch:tape} covers the tape object that replaced a
+singleton. Chapter~\ref{ch:raii} covers the RAII surface.
+Chapter~\ref{ch:arena} covers the two storage arenas and the measurements that
+shaped them. Chapter~\ref{ch:threads} covers concurrency.
+Chapter~\ref{ch:verify} covers how the library is verified, which is a design
+choice in its own right.
+
+\section{The source tree}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+\code{maxwell.hpp}            & the public surface; includes nothing internal \\
+\code{inc/Active.hpp}         & the \code{active} scalar and its operators \\
+\code{inc/API.hpp}            & the free-function protocol \\
+\code{inc/Tape.hpp}           & \code{maxwell::Tape} and \code{maxwell::Jacobian} (public) \\
+\code{inc/TapeState.hpp}      & \code{internals::TapeState} --- one tape's whole state \\
+\code{inc/Process.hpp}        & the recorder and eliminator \\
+\code{inc/Vertex.hpp}         & \code{Vertex}, \code{Adjacency}, \code{AdjArena} \\
+\code{inc/Edge.hpp}           & \code{Edge}, \code{EdgeArena} \\
+\code{inc/Typedefs.hpp}       & \code{largeint}, \code{elim\_t} \\
+\code{src/*.cpp}              & six translation units \\
+\code{examples/}              & nine programs; \code{make test} runs all of them \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\code{maxwell.hpp} deliberately does not include \code{Vertex.hpp},
+\code{Edge.hpp}, \code{Process.hpp} or \code{TapeState.hpp}. That is not
+tidiness: it is what allowed the graph representation to be replaced twice
+(Chapter~\ref{ch:arena}) without a single caller changing, and it is why the
+public \code{Tape} holds one forward-declared pointer rather than its state by
+value.
+
+\chapter{Recording: the graph}
+\label{ch:graph}
+
+\section{The active scalar}
+
+\code{active} is a 48-byte value carrying its numeric value and its position in
+the graph:
+
+\begin{lstlisting}
+class active
+{
+public:
+  mutable bool     reachable;   // does this value depend on an independent?
+  mutable largeint idx;         // vertex index, 0 if passive
+  mutable largeint owner_idx;   // which partition recorded it
+  mutable largeint old_idx;     // saved across a replay
+  mutable double   val;         // the value itself
+  mutable internals::Vertex * vtx;   // cached vertex, or NULL
+  ...
+};
+\end{lstlisting}
+
+Every member is \code{mutable} so that the operators can take
+\code{const active\&} and still update bookkeeping. This is defensible for
+\code{idx} and \code{vtx}, which are cache-like state on a logically constant
+object; it is less defensible for \code{val} and \code{reachable}, which are
+the object's actual value, and it means \code{const active\&} promises less
+than it appears to. It is recorded here as a known wart rather than defended.
+
+\paragraph{\code{active} is not a value type.} Copying one \emph{records}. The
+copy constructor is:
+
+\begin{lstlisting}
+active::active( const active & x ):
+reachable(x.reachable), idx(0), owner_idx(0), old_idx(0), val(x.val), vtx(NULL)
+{
+  unary_op( x , 1.0 , *this , false );   // an identity vertex and edge
+}
+\end{lstlisting}
+
+ADOL-C and CoDiPack do the same, and it is the only way an overloading library
+can track a copy. But nothing in the type says so, and the standard library
+copies things constantly. Measured on \code{y = x0*x1 + x0}:
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+what the program does & tape size \\
+\midrule
+the straight-line expression                          & 480 bytes \\
+\dots with one \code{active} passed \emph{by value}   & 600 bytes \\
+\dots with 8 \code{push\_back} into \code{std::vector<active>} & \textbf{2\,640 bytes} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Eight \code{push\_back}s into a growing vector cause $1+2+4+8=15$ reallocation
+copies, and every copy records an identity vertex and edge: exactly the
+$15\times144$ bytes measured. The derivative is still correct; the tape is five
+and a half times larger than it should be, and nothing warns. Section~\ref{sec:pitfalls}
+tells users how to avoid it; Section~\ref{sec:independents} describes the
+library-side mitigation, which is that the tape now hands out its own
+independents from storage sized exactly once.
+
+\section{How an operation is recorded}
+
+Each overloaded operator computes the value and the local partials, then calls
+one of five recording entry points. Multiplication is representative:
+
+\begin{lstlisting}
+active maxwell::operator*( const active & x1 , const active & x2 )
+{
+  active x3;
+  x3.val = x1.val*x2.val;
+  x3.reachable = x1.reachable || x2.reachable;
+  binary_op( x1 , x2.val , x2 , x1.val , x3 );   // dy/dx1 = x2, dy/dx2 = x1
+  return x3;
+}
+\end{lstlisting}
+
+\code{binary\_op} reaches the current tape and forwards to \code{Process}, whose
+behaviour differs sharply between the two passes:
+
+\begin{lstlisting}
+void Process::binary_op( const active & x1 , double dy_dx1 ,
+                         const active & x2 , double dy_dx2 , const active & x3 )
+{
+  if(profiling){
+    if(x3.reachable){
+      x3.idx = next_vertex_idx++;
+      intmed_count++;
+      if(&x1==&x2){ edge_count++; }
+      else{
+        if(x1.reachable) edge_count++;
+        if(x2.reachable) edge_count++;
+      }
+    }
+  }else{
+    Vertex * v1=NULL , * v2=NULL , * v3=NULL;   // SVEGP-20
+    ...
+    if(x3.reachable){
+      x3.idx = next_vertex_idx++;
+      v3 = vertex_on_lhs(x3);
+      if(&x1==&x2){ add_edge(v1,v3,dy_dx1+dy_dx2); edge_count++; }
+      else{
+        if(x1.reachable){ add_edge(v1,v3,dy_dx1); edge_count++; }
+        if(x2.reachable){ add_edge(v2,v3,dy_dx2); edge_count++; }
+      }
+    }
+  }
+  check_memory();
+}
+\end{lstlisting}
+
+Three things in that fragment are load-bearing.
+
+\paragraph{The profiling pass allocates nothing.} It only counts. That is what
+makes the budget decision possible before a single vertex exists, and it is
+what Chapter~\ref{ch:arena} exploits: the exact vertex and edge counts are known
+in advance.
+
+\paragraph{Aliasing is handled explicitly.} \code{\&x1==\&x2} detects
+\code{x*x}, where a naive implementation would add two edges between the same
+pair of vertices and then have to merge them. The partials are summed instead.
+\code{examples/invariants} pins this path as its \code{alias} case.
+
+\paragraph{The \code{NULL} initialisers are a fix, not style.} \svegp{20}:
+those pointers were left uninitialised, and \code{add\_edge} only guards against
+\code{NULL}. An indeterminate non-null value walked straight into
+\code{tgt->add\_in\_edge(src,\dots)}. The library's own callers always set the
+reachability flags consistently, so it never fired internally --- but
+\code{binary\_op} and its siblings are \emph{exported} for hand-written
+operators, and there a mismatched flag turns a dropped edge into a wild pointer
+dereference.
+
+\section{Reachability}
+
+\code{reachable} is the flag that keeps passive arithmetic out of the graph. A
+value is reachable if it descends from a registered independent. A computation
+on two passive values records nothing: \code{operator=} from a \code{double}
+calls \code{passive\_op}, which kills the vertex and sets \code{idx=0}. This is
+why a program can mix \code{active} and \code{double} freely and only pay for
+the part that actually depends on the inputs.
+
+\section{The graph}
+
+A \code{Vertex} is 72 bytes and holds nothing but its identity and its two
+adjacency lists:
+
+\begin{lstlisting}
+class Vertex
+{
+public:
+  bool     alive;       // true if this vertex is a declared dependent
+  largeint idx;
+  largeint owner_idx;
+
+  Adjacency in_edges;
+  Adjacency out_edges;
+  ...
+};
+\end{lstlisting}
+
+An \code{Edge} is 24 bytes --- a partial derivative and its two endpoints:
+
+\begin{lstlisting}
+class Edge
+{
+public:
+  double   eval;    // the local partial derivative
+  Vertex * src;
+  Vertex * tgt;
+  ...
+};
+\end{lstlisting}
+
+\code{alive} deserves a note, because the name is misleading: it does not mean
+``not yet destroyed''. It marks a vertex as a \emph{declared dependent}, and its
+only effect is that elimination refuses to eliminate it. Dependents must survive
+because they are the rows of the Jacobian.
+
+Adjacency is a sorted array of \code{(neighbour index, edge pointer)} pairs,
+binary searched. Its members are called \code{first} and \code{second} because
+the elimination code was written against \code{std::map} and is full of
+\code{it->second}; keeping the names meant the representation could be replaced
+without touching a line of the algorithm. Chapter~\ref{ch:arena} covers how the
+storage beneath it evolved.
+
+\chapter{Elimination}
+\label{ch:elim}
+
+\section{The operation}
+
+Eliminating an intermediate vertex $v$ removes it from the graph while
+preserving every path through it. For each in-edge $(u,v)$ with weight $a$ and
+each out-edge $(v,w)$ with weight $b$, the product $ab$ is added to the edge
+$(u,w)$, creating it if it does not exist. The cost is the number of such
+products:
+\[
+  \mathrm{cost}(v) = \deg^{-}(v)\cdot\deg^{+}(v).
+\]
+
+The implementation is the whole of \code{Vertex::eliminate}:
+
+\begin{lstlisting}
+largeint Vertex::eliminate( EdgeArena & arena , AdjArena & adj )
+{
+  largeint m = in_edges.size();
+  largeint n = out_edges.size();
+  largeint cost = m*n;
+
+  for( outedge_it=out_edges.begin() ; outedge_it!=out_edges.end() ; outedge_it++ )
+    outedge_it->second->tgt->in_edges.erase(this->idx);
+
+  for( inedge_it=in_edges.begin() ; inedge_it!=in_edges.end() ; inedge_it++ )
+  {
+    inedge_it->second->src->out_edges.erase(this->idx);
+
+    for( outedge_it=out_edges.begin() ; outedge_it!=out_edges.end() ; outedge_it++ )
+    {
+      double cij = (inedge_it->second->eval)*(outedge_it->second->eval);
+
+      Edge * direct_link = NULL;
+      Adjacency::iterator direct_link_it =
+        inedge_it->second->src->out_edges.find(outedge_it->second->tgt->idx);
+
+      if(direct_link_it!=inedge_it->second->src->out_edges.end())
+        direct_link = direct_link_it->second;
+
+      if(direct_link){
+        direct_link->eval += cij;                       // fold into an existing edge
+      }else{
+        outedge_it->second->tgt->add_in_edge(            // fill-in
+          inedge_it->second->src , cij , arena , adj );
+      }
+    }
+    arena.release( inedge_it->second );
+  }
+
+  for( outedge_it=out_edges.begin() ; outedge_it!=out_edges.end() ; outedge_it++ )
+    arena.release( outedge_it->second );
+
+  in_edges.clear(adj);
+  out_edges.clear(adj);
+  return cost;
+}
+\end{lstlisting}
+
+The \code{find} on the predecessor's out-list is the \emph{direct-link probe},
+and it is the reason adjacency must stay sorted rather than becoming a linked
+list. Measured degrees on that list are 40 entries at $n_x=20$ and 109 at
+$n_x=40$, growing with problem size; seven comparisons over contiguous memory
+beat a tree walk, but a linear scan over 109 scattered nodes would have made
+elimination asymptotically worse on exactly the deep tapes the library exists
+for.
+
+\section{Order matters, and adjacency order does not}
+
+This distinction was assumed backwards during design and was settled by
+experiment.
+
+Within one \code{eliminate()} call, \code{in\_edges} is keyed by source index
+and \code{out\_edges} by target index, so each $(u,w)$ pair occurs exactly once
+and \code{direct\_link->eval += cij} fires at most once per pair per
+elimination. All accumulation \emph{across} eliminations is ordered by
+elimination order, which comes from \code{intmed\_vec} and \code{intmed\_map},
+never from adjacency.
+
+Reversing the adjacency iteration order therefore changes nothing --- verified
+by doing it, against twelve pinned Jacobian hashes, all of which stayed
+byte-identical. That freed the storage layout to be chosen for speed alone.
+
+Elimination order, by contrast, changes the floating-point result in the last
+bits, exactly as it should: \code{examples/invariants} records
+\code{nonlinear/rev} at hash \code{0xaeb4c2dad9593bc3} and \code{nonlinear/fwd}
+at \code{0x814891dd92fad4e7}, with costs 3\,291 and 3\,333. Same Jacobian to
+within rounding; different accumulation order; different last bits. Any change
+that reorders elimination is therefore a change to the numbers, and the pinned
+table will say so.
+
+\section{Direction}
+
+\begin{lstlisting}
+largeint Process::eliminate()
+{
+  if(elim_mode==FORWARD_ELIM){ return forward_eliminate(); }
+  return reverse_eliminate();
+}
+\end{lstlisting}
+
+Forward elimination walks \code{intmed\_vec} in order; reverse walks it
+backwards. Both refuse to eliminate a vertex whose \code{alive} flag is set, and
+both skip vertices with no in-edges (independents) or no out-edges that are
+dependents.
+
+\svegp{23} is worth recording: the direction was not selectable at all.
+\code{checkpoint()} called \code{reverse\_eliminate()} unconditionally, so
+forward elimination could never be the elimination that produces the Jacobian
+--- calling \code{forward\_elimination()} afterwards merely walked an
+already-eliminated graph and reported the same cost. The \code{elim\_t} enum had
+sat unused in \code{Typedefs.hpp} since the beginning, and the old test Makefile
+recorded that a \code{set\_elim\_mode()} had once been \emph{removed} from the
+API, so restoring it was recovering an intended feature rather than inventing
+one.
+
+\section{Harvest}
+
+After elimination, the surviving edges from independents to dependents are the
+Jacobian entries. \code{Process::harvest} walks the dependents, and for each
+looks up the edge from each independent:
+
+\begin{lstlisting}
+Edge * e = dep_vPtr->from(indep_vPtr);
+
+if(e){
+  A[dep_pos][i] = e->get_partial();
+}
+else if(indep_vPtr==dep_vPtr){
+  A[dep_pos][i] = 1.0;     // a dependent that IS an independent
+}
+\end{lstlisting}
+
+The \code{indep\_vPtr==dep\_vPtr} branch handles \code{y = x} --- a dependent
+that is also an independent has no edge to itself and a derivative of exactly
+one. \code{examples/invariants} pins this as its \code{passthrough} case.
+
+Two defects lived here. \svegp{03}: the column of an entry is the
+\emph{position} of the independent, not its global vertex index; using
+\code{get\_idx()-1} coincides with the column only while the independents happen
+to occupy indices $1..n$ in registration order, and registering one after any
+active arithmetic both lost a column and wrote past the end of the row.
+\svegp{05}: the requested shape used to be trusted, so a caller passing $m$ and
+$n$ transposed overran the heap. It is checked now, and refuses:
+
+\begin{lstlisting}
+if( m != this->dep_vec.size() || n != this->indep_count ){
+  std::cerr << "maxwell::harvest: requested " << m << "x" << n
+            << " but the graph holds " << this->dep_vec.size() << "x" << this->indep_count
+            << " -- refusing to write out of bounds.\n";
+  return;
+}
+\end{lstlisting}
+
+\chapter{Checkpointing}
+\label{ch:ckpt}
+
+\section{The idea}
+
+A tape for a deep computation does not fit in memory. The classical remedy is
+to store the program's intermediate \emph{state} at checkpoints and recompute
+between them. Maxwell does the dual: it stores nothing and \emph{replays the
+program}, recording a different slice of the graph each time.
+
+The user's computation is placed in a \emph{section} driven by a loop:
+
+\begin{lstlisting}
+while( checkpoint(x,y) ){
+  try{ f(); }
+  catch( BreakException const & ){}
+}
+\end{lstlisting}
+
+\code{checkpoint} returns \code{true} while another pass is needed. The first
+pass is the \emph{profiling} pass: nothing is allocated, everything is counted,
+and the partition boundaries are discovered. Then one \emph{productive} pass per
+partition follows.
+
+\section{Partitions and the owner index}
+
+Partition membership is carried on two counters in \code{Process}:
+\code{next\_owner\_idx}, which advances as the section runs, and
+\code{tgt\_owner\_idx}, which names the partition this pass is to record.
+Recording is gated by a single scalar equality:
+
+\begin{lstlisting}
+bool Process::is_proc()
+{
+  if(next_owner_idx==tgt_owner_idx){ return true; }
+  return false;
+}
+\end{lstlisting}
+
+\noindent
+Every vertex-creating helper begins with \code{if(is\_proc())}. So during a
+productive pass the section's arithmetic runs in full, but only the operations
+belonging to one partition build graph. \textbf{Exactly one partition is active
+at a time, by construction} --- a fact with consequences for parallelism that
+Chapter~\ref{ch:threads} returns to.
+
+Boundaries are found by \code{check\_memory}, called after every recorded
+operation:
+
+\begin{lstlisting}
+void Process::check_memory()
+{
+  largeint cur_mem_usage = (intmed_count*VERTEX_BYTES + edge_count*EDGE_BYTES);
+  largeint part_size = cur_mem_usage - prev_mem_usage;
+
+  if(part_size>=mem_size){
+    if(!profiling){
+      if(is_proc()){
+        tgt_owner_idx--;
+        ... move intmed_vec into intmed_map, merging duplicates ...
+        if(throwable){ throw BreakException(); }
+      }
+    }
+    prev_mem_usage = cur_mem_usage;
+    next_owner_idx++;
+  }
+}
+\end{lstlisting}
+
+When the active partition is complete, the pass has no further use for the rest
+of the section, so it is abandoned by throwing \code{BreakException} from inside
+the operator. This is the mechanism that makes replay cheap: a pass that has
+already recorded its partition does not run the remaining arithmetic at all.
+
+The invariant $\text{BreakExceptions} = \text{chunks} - 1$ holds throughout,
+because the first productive pass never throws: \code{reinitialize()} sets
+\code{throwable} only once its own run counter is non-zero.
+
+\section{The replay loop}
+
+\begin{lstlisting}
+bool maxwell::checkpoint( active * x , active * y )
+{
+  TapeState * tp = current_tape();
+  if(!tp){ /* diagnose and end the loop */ return false; }
+
+  Process * myProc = &tp->proc;
+
+  if(!tp->run_counter){ tp->run_counter++; return true; }   // profiling pass
+
+  if(tp->run_counter==1){
+    for( largeint k=0 ; k<tp->dependent_size ; k++ ){
+      y[k].old_idx = y[k].idx;
+      tp->dep_shadow_copy[k] = y[k].val;
+    }
+    myProc->finalize();                        // close profiling
+    tp->run_target = myProc->get_tgt_owner_idx();
+    myProc->disable_profiling();
+  }else{
+    myProc->eliminate();                       // fold the partition just recorded
+  }
+
+  internals::restore_values(x,y);              // put the independents back
+  myProc->reinitialize();
+
+  if(tp->run_counter<=tp->run_target){ tp->run_counter++; return true; }
+
+  for( largeint k=0 ; k<tp->dependent_size ; k++ ){
+    y[k].idx = y[k].old_idx;
+    y[k].val = tp->dep_shadow_copy[k];
+  }
+  return false;
+}
+\end{lstlisting}
+
+\code{restore\_values} resets the independents from \code{indep\_shadow\_copy},
+which is why the section produces identical values on every pass. Note that
+\code{tgt\_owner\_idx} counts \emph{down}: the first productive pass records the
+\emph{last} partition, and elimination accumulates backwards through the tape.
+
+\section{The contract, which is the sharpest edge in the library}
+\label{sec:contract}
+
+The section is run $1+N$ times, where $N$ is not known until profiling finishes,
+and it may be aborted at an arbitrary operator by a \code{throw} from inside
+\code{operator*}. Three requirements follow, and for a long time none of them
+was written down anywhere:
+
+\begin{enumerate}
+\item it must be \textbf{re-runnable} --- same inputs, same result, every time;
+\item it must be \textbf{side-effect free} --- the profiling pass runs it an
+      extra time, so any I/O or RNG inside it happens once more than the author
+      expects;
+\item it must be \textbf{exception-safe} --- a \code{BreakException} unwinds
+      from the middle of the computation.
+\end{enumerate}
+
+Requirement (3) was broken during a port: \code{heat\_assim} originally held its
+two state buffers in raw \code{new[]} and swapped them by pointer, leaking
+$n_x+1$ actives on \emph{every} break --- thousands across a conjugate-gradient
+run. It took a rewrite to \code{std::vector<active>} to fix, and nothing would
+have caught it.
+
+The RAII surface (Chapter~\ref{ch:raii}) takes requirement (3) off the caller
+entirely by owning the \code{try}/\code{catch}. It cannot take (1) and (2), and
+does not pretend to.
+
+\section{The property that makes it trustworthy}
+
+Chunking must not change the answer. \code{examples/regress} asserts this
+directly, sweeping budgets against a reference computed at $2^{30}$ bytes:
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+budget (bytes) & max relative deviation \\
+\midrule
+200\,000 & 0.0 \\
+50\,000  & 0.0 \\
+20\,000  & 0.0 \\
+8\,000   & 0.0 \\
+4\,000   & 0.0 \\
+2\,000   & 0.0 \\
+1\,000   & 0.0 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Exactly zero, not a tolerance. \code{examples/invariants} adds twelve pinned
+witnesses across five tape shapes, each run whole and chunked: the
+\code{lattice} case gives an identical Jacobian hash whole, at 5 chunks, at 16
+chunks, and under both elimination directions.
+
+\section{What replay costs}
+\label{sec:replaycost}
+
+Measured on a synthetic tape of 16 variables and 120 steps
+($\approx$1\,920 recorded operations), GCC 13.3, \code{-O2}:
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+budget & partitions & time & vs.\ whole & replay share \\
+\midrule
+the program itself, no AD & --- & 0.0085\,ms & --- & --- \\
+whole tape   & 1   & 5.78\,ms  & $1.00\times$ & --- \\
+200\,kB      & 8   & 15.40\,ms & $2.66\times$ & 62\% \\
+50\,kB       & 29  & 18.35\,ms & $3.18\times$ & 68\% \\
+12\,kB       & 121 & 36.40\,ms & $6.30\times$ & 84\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+Two conclusions. First, the differentiation machinery costs roughly $680\times$
+the underlying arithmetic, so the target for any optimisation is the tape, never
+the user's function. Second, the elimination cost is \emph{identical} at every
+budget (33\,647 multiply--adds), so all of the growth in that table is replay.
+Chunking is not free, and the cheapest speedup available to a user is a larger
+budget.
+
+\chapter{The memory budget}
+\label{ch:mem}
+
+\section{What a graph costs}
+
+The budget is spent against a model of the graph's payload:
+
+\begin{lstlisting}
+static const largeint VERTEX_BYTES = sizeof(Vertex);                    // 72
+static const largeint EDGE_BYTES   = sizeof(Edge) + 2*sizeof(AdjEntry); // 24 + 32 = 56
+\end{lstlisting}
+
+used at exactly three sites: \code{check\_memory()}, \code{get\_memory()}, and
+the profiling branch of \code{Process::finalize()}.
+
+\section{\svegp{24}: the accounting never counted adjacency}
+
+The original model was \code{intmed\_count*sizeof(Vertex) + edge\_count*sizeof(Edge)}.
+But an edge is not only its \code{Edge} object: it is also the \emph{two
+adjacency entries that reference it}, one in the target's in-list and one in the
+source's out-list. Before the arenas those were a pair of red-black tree nodes
+and went uncounted; after the representation change they became a pair of
+\code{AdjEntry} and were \emph{still} uncounted. Same omission, different
+container. An edge costs $24+2\times16=56$ bytes of payload, not 24, so the
+budget had been under-charging every edge by more than half since the beginning.
+
+The constants deliberately exclude allocator overhead, container slack and arena
+block granularity. Those are properties of the allocator, not of the graph, and
+--- decisively --- they are not knowable during the profiling pass, which is
+when the budget decision is made and when nothing has been allocated yet. So the
+model is the graph's payload exactly, and the process always holds somewhat
+more.
+
+\section{The two errors were cancelling}
+
+Correcting the edge charge moved the chunk counts \emph{back to where they had
+started}:
+
+\begin{center}
+\begin{tabular}{@{}lrrl@{}}
+\toprule
+ & \code{sizeof(Vertex)} & per edge & lattice chunk counts \\
+\midrule
+original                  & 120 & 24 & 5, 16, 4 \\
+after the representation work & 72 & 24 & 4, 11, 3 \\
+after \svegp{24}          & 72 & \textbf{56} & \textbf{5, 16, 4} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The original formula over-charged for vertices (120 against a real payload of
+72) and charged nothing for adjacency, and the two errors roughly cancelled.
+That is why the examples' hand-calibrated budgets worked at all, and why
+recalibrating them turned out to be almost a no-op: \code{bratu} $14\to13$,
+\code{hybrdj1} $20\to18$, \code{heat} $100\to99$.
+
+This is the most instructive defect in the library's history. A wrong model
+that happens to produce right-looking answers is harder to find than one that
+produces wrong answers, and it is found only by measuring the thing the model
+claims to predict.
+
+\section{The drift alarm}
+
+Because the model deliberately under-reports, the gap between it and reality
+must be watched rather than assumed. \code{examples/invariants} measures process
+heap against the accounted figure on two fixed shapes and fails outside a band:
+
+\begin{lstlisting}
+const double LOW = 1.2, HIGH = 1.9;
+...
+const double ratio = double(peak)/double(acct);
+const bool ok = (ratio>=LOW && ratio<=HIGH);
+\end{lstlisting}
+
+The band is set by experiment, not by guesswork, and it has been re-pinned twice
+as the representation changed:
+
+\begin{center}
+\begin{tabular}{@{}lll@{}}
+\toprule
+ & correct accounting & \svegp{24} reverted \\
+\midrule
+before the adjacency arena & 1.67 -- 1.70 & 2.38 -- 2.42 \\
+after the adjacency arena  & \textbf{1.51 -- 1.56} & 2.16 -- 2.22 \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+The first attempt at a band was $[1.0,3.0]$, and the control --- reverting
+\svegp{24} --- walked straight through it; only the pinned chunk column caught
+the reverted fix. The band was tightened to $[1.2,2.2]$. Then the adjacency
+arena lowered the real heap, which lowered \emph{both} columns, and $2.16$
+landed back inside $[1.2,2.2]$: the same failure, a second time. It is
+$[1.2,1.9]$ now, verified in both directions.
+
+The alarm is skipped under AddressSanitizer, which replaces the allocator
+wholesale and makes \code{mallinfo2} report ASan's redzoned bookkeeping rather
+than the program's footprint. The first ASan run of the alarm reported
+``0 accounted, 0 heap, \code{-nan}x''.
+
+\section{\svegp{25}: a budget that was not a budget}
+
+\code{examples/heat} was the only example not taking a plain byte budget. Its
+third argument was a \emph{multiplier}: the budget was \code{it*431208}, and
+431\,208 was one time step's tape footprint measured at $n_x=400$. So \code{it}
+meant ``how many $n_x{=}400$ time steps fit in a chunk'', and at any other grid
+it silently meant something else --- at $n_x=40$ a step costs about a tenth as
+much, so \code{it=1} bought ten steps per chunk rather than one.
+
+It takes bytes now, and the knob finally behaves like one:
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+invocation & chunks \\
+\midrule
+\code{40 100 400000}  & 11 \\
+\code{40 200 400000}  & 22 \hspace{1em}\emph{double the steps, double the chunks} \\
+\code{100 400 400000} & 107 \\
+\code{100 400 800000} & 54 \hspace{1em}\emph{double the budget, half the chunks} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The change had a hazard: \code{main.cpp} and \code{RUNARGS} in the example's
+Makefile had to agree, and bytes in one with a stale \code{1} in the other is a
+one-byte budget, which chunks on every operation and reads as a hang rather than
+a mistake. So \code{main.cpp} rejects an implausibly small budget and names the
+exact fix. A stale Makefile now fails in a second with instructions instead of
+appearing to hang.
+
+\chapter{The tape object}
+\label{ch:tape}
+
+\section{\svegp{26}: two global states that had to agree}
+
+The library used to have not one global but two, and they had to be kept
+consistent by hand: \code{Process::instance}, a singleton holding the graph;
+and about a dozen file-statics in \code{API.cpp} holding everything else about
+the recording --- \code{run\_target}, \code{run\_counter},
+\code{independent\_size}, the 2-D dimensions, and the two shadow-copy buffers.
+Neither knew about the other.
+
+\svegp{17} --- a stride bug that wrote past the end of the heap on any
+non-square grid --- lived in the second one, in code that had no business
+existing apart from the tape it described:
+
+\begin{lstlisting}
+// the row stride of a dep_y_dim x dep_x_dim grid is dep_x_dim (the COLUMNS),
+// not dep_y_dim.  Flattening with dep_y_dim aliased entries onto each other
+// and ran off the end of dep_shadow_copy as soon as the grid was not square.
+for( largeint i=0 ; i<tp->dep_y_dim ; i++ ){
+  for( largeint j=0 ; j<tp->dep_x_dim ; j++ ){
+    tp->dep_shadow_copy[tp->dep_x_dim*i+j] = y[i][j].val;
+  }
+}
+\end{lstlisting}
+
+Every example used a square grid --- \code{bratu} calls
+\code{set\_indep\_dimension(n,n)} --- which is why nothing caught it for years.
+
+Both states are now members of one object:
+
+\begin{lstlisting}
+class TapeState
+{
+public:
+  Process proc;                    // the graph, by value
+
+  largeint independent_size, dependent_size, memory_available;
+  largeint indep_x_dim, indep_y_dim, dep_x_dim, dep_y_dim;
+  largeint run_target, run_counter;
+
+  double * indep_shadow_copy;
+  double * dep_shadow_copy;
+  ...
+private:
+  TapeState( const TapeState & );          // owns buffers and a graph
+  TapeState & operator=( const TapeState & );
+};
+\end{lstlisting}
+
+and the only mutable object left at namespace scope in the entire library is one
+pointer:
+
+\begin{lstlisting}
+static thread_local TapeState * g_current_tape = NULL;
+\end{lstlisting}
+
+\noindent
+\code{nm} on the archive confirms it: one entry in the data segment. Everything
+else static is \code{const}.
+
+\paragraph{No public API changed.} The operators still \emph{find} the tape
+rather than being handed one, so no signature moved and no user program was
+touched --- which is precisely what let the existing verification net check the
+whole change. All twelve pinned invariants came out bit-identical.
+
+\section{What that bought, precisely}
+
+Being exact about which limitation came from which decision was the point of the
+exercise:
+
+\begin{itemize}
+\item \textbf{Two tapes at once} --- structurally impossible under the
+      singleton, since \code{get\_proc\_instance()} handed the same
+      \code{Process} to everybody. Now routine.
+\item \textbf{Threads} --- the \code{thread\_local} pointer removes the
+      structural reason the library could never be thread-safe.
+      Chapter~\ref{ch:threads} measures what that actually delivers.
+\item \textbf{Not nesting.} A tape whose edge weights are themselves
+      \code{active} --- what an exact Hessian needs --- requires the scalar type
+      to be templated. That is a separate and larger change, and removing the
+      singleton does not begin it.
+\end{itemize}
+
+\section{\svegp{27}: the compiler found what had to move, not what had to be guarded}
+
+Deleting the file-statics and letting the build fail was the right way to
+enumerate the work: 29 uses of \code{myProc} and about 40 of the rest, all named
+precisely. But the technique has a blind spot, and it bit.
+
+A function reading a \emph{file-static} was reading something that always
+existed and was simply zero. The same function reading \code{tp->field}
+dereferences a pointer that is null when no tape is open. The code compiles
+either way.
+
+\code{checkpoint()} was the sharp one. With no tape it used to return
+\code{true} on the first call --- \code{run\_counter} was 0 --- run the caller's
+section with nothing recording, then null-dereference on the \emph{second} call.
+Seven entry points needed guards no compiler was going to ask for. They are
+guarded now, preserving the old tolerant answers where those were sensible
+(\code{get\_partitions()} still returns 0 with no tape), and \code{checkpoint()}
+ends the loop before it starts rather than running a section that records
+nothing.
+
+\code{examples/regress} now calls \emph{every} public entry point with no tape
+open and asserts none of them crash. That is the test that would have caught it,
+and it did not exist until the bug made the case for it.
+
+\section{\svegp{27}: ownership belongs in a destructor}
+
+A second, quieter defect followed from the same change. \code{initialize()} on
+an already-open tape diagnoses the misuse and deletes the old tape --- but
+\code{\textasciitilde TapeState} freed only the two shadow buffers, and
+\code{Process} had \emph{no destructor at all}. The graph teardown lived only in
+the productive branch of \code{Process::finalize()}, which that path never
+calls. Every \code{Vertex} leaked, in proportion to the tape.
+
+Reproduced under LeakSanitizer on a two-line program: 280 bytes in 6
+allocations, with stacks in \code{vertex\_on\_lhs} and \code{vertex\_on\_rhs}.
+It scales with the graph, so a program that re-initialises in a loop leaks the
+whole thing each time.
+
+The fix moved the teardown into a private \code{destroy\_graph()} that both
+\code{\textasciitilde Process()} and \code{finalize()} call:
+
+\begin{lstlisting}
+void Process::destroy_graph()
+{
+  std::set<Vertex*> owned;
+
+  for( ... intmed_map ... ) if(it->second) owned.insert(it->second);
+  for( ... intmed_vec ... ) if(*it)        owned.insert(*it);
+
+  for( std::set<Vertex*>::iterator it=owned.begin() ; it!=owned.end() ; it++ )
+    retire(*it);
+
+  intmed_map.clear();
+  intmed_vec.clear();
+  dep_vec.clear();
+
+  edge_arena.clear();
+  adj_arena.clear();
+}
+\end{lstlisting}
+
+The \code{std::set} is deliberate. \code{intmed\_vec} and \code{intmed\_map}
+never hold the same vertex at a moment a caller can observe --- each transfer
+clears the source before returning --- but a teardown is the wrong place to lean
+on that, and a graph abandoned mid-section is exactly where the two containers
+are least likely to be in the state the happy path leaves them in.
+\code{dep\_vec} is cleared rather than deleted from: every vertex in it is also
+in \code{intmed\_map}, so deleting from both would be a double free.
+
+\chapter{The RAII surface}
+\label{ch:raii}
+
+\section{Why}
+
+The free-function protocol is eleven ordered steps over hidden global state, and
+--- this is the part that matters --- four of them go wrong by being
+\emph{forgotten} rather than by being written incorrectly: the
+\code{try}/\code{catch}, \code{free\_jacobian}, \code{finalize}, and the
+\code{delete[]}s. Every misuse the audit found was a silent memory error before
+it was made a diagnostic. Diagnostics are second best. The best is making the
+misuse unrepresentable:
+
+\begin{lstlisting}
+Tape t(n,m,budget);                     // ctor/dtor replace initialize/finalize
+active * x = t.independents(x0);        // hands back the only thing you can use
+t.run( y , [&]{ y = f(x); } );          // owns the loop AND the try/catch
+t.dependents(y);
+Jacobian J = t.harvest();               // a value; no free_jacobian
+\end{lstlisting}
+
+Each step returns or requires the thing the next one needs, so a step cannot be
+skipped or reordered without the compiler saying so.
+
+\section{A wrapper, not a second implementation}
+
+This is the central implementation decision of the surface. Every member makes
+its tape current for the duration and then calls the same free function the
+examples have always called:
+
+\begin{lstlisting}
+maxwell::Jacobian maxwell::Tape::harvest( bool print_out )
+{
+  Scope s(*this);
+
+  const largeint m = st_->dependent_size;
+  const largeint n = st_->independent_size;
+
+  double ** A = NULL;
+  maxwell::harvest(m,n,A,print_out);
+
+  if(!A) return Jacobian();
+
+  Jacobian J(m,n);
+  for( largeint i=0 ; i<m ; i++ )
+    for( largeint j=0 ; j<n ; j++ ) J(i,j) = A[i][j];
+
+  maxwell::free_jacobian(m,A);
+  return J;
+}
+\end{lstlisting}
+
+Consequently the twelve pinned invariants, the 68 finite-difference checks and
+the budget-invariance sweep all cover the new surface, because underneath it
+\emph{is} the old one. A reimplementation would have needed its own net. The
+claim was then tested directly by migrating the verification harness itself to
+the object surface: all twelve rows came out bit-for-bit identical.
+
+\section{Scopes}
+
+A \code{Tape} is not current outside its own calls. That is what lets two
+\code{Tape} objects coexist without either being closed, and what makes a throw
+out of a caller's section leave the current-tape pointer where it found it:
+
+\begin{lstlisting}
+class Scope
+{
+public:
+  explicit Scope( Tape & t ) : t_(t) { t_.enter_(); }
+  ~Scope(){ t_.leave_(); }
+private:
+  Tape & t_;
+  Scope( const Scope & );
+  Scope & operator=( const Scope & );
+};
+\end{lstlisting}
+
+\section{\svegp{29}: a bug only a constructed test could find}
+
+\code{enter\_}/\code{leave\_} originally kept a single saved-tape slot. That is
+correct for nesting two \emph{different} tapes, and wrong for a tape re-entered
+from inside its own section --- which happens the moment a caller reads
+\code{t.memory()} while recording, as the drift alarm does:
+
+\begin{lstlisting}
+void maxwell::Tape::enter_()
+{
+  if( st_->scope_depth==0 ){ st_->saved = internals::current_tape(); }
+  st_->scope_depth++;
+  internals::set_current_tape(st_);
+}
+
+void maxwell::Tape::leave_()
+{
+  if( st_->scope_depth ) st_->scope_depth--;
+  if( st_->scope_depth ) return;          // still inside an outer scope
+  internals::set_current_tape( st_->saved );
+  st_->saved = NULL;
+}
+\end{lstlisting}
+
+Without the depth counter the inner scope overwrites the real predecessor with
+the tape itself, and leaving the \emph{outer} scope restores \code{NULL} rather
+than the enclosing tape. Nothing reports it: an enclosing section simply carries
+on recording onto no tape at all and harvests a silently wrong Jacobian.
+
+What is instructive is that the example which \emph{contains} the re-entrant
+call does not detect the bug --- it has no enclosing tape for the clobber to
+destroy. Only a deliberately constructed case in the regression suite, with one
+tape running inside another's section, fails. The migration created the
+hazardous call; a test written specifically for it revealed the consequence.
+
+\section{Mixing the two surfaces}
+
+Since the free functions remain public, a program could call \code{finalize()}
+from inside a \code{Tape} section --- which would delete the state the
+\code{Tape} object still points at, a use-after-free the moment the block ends.
+Both \code{initialize()} and \code{finalize()} refuse when the current tape is
+object-owned:
+
+\begin{lstlisting}
+if( open && open->owned ){
+  std::cerr << "maxwell::initialize: a maxwell::Tape object is recording -- "
+               "not opening a second tape over it.  Use one surface or the "
+               "other, not both.\n";
+  return;
+}
+\end{lstlisting}
+
+Removing that guard and running the suite under AddressSanitizer produces
+\code{heap-use-after-free}, which is how the guard is known to be load-bearing.
+
+\section{Why the free functions stayed}
+
+The obvious follow-up to an object surface is to retire what it wraps. That was
+considered and rejected on evidence: three things the object surface cannot
+express, all of them exercised by the regression suite.
+
+\begin{itemize}
+\item \textbf{Stepping the loop.} \code{run()} owns the whole checkpoint loop,
+      which is exactly what makes it safe --- the \code{try}/\code{catch} cannot
+      be forgotten. The price is that a caller cannot interleave two tapes
+      mid-replay, which the strongest available test of the two-tape capability
+      does.
+\item \textbf{Testing the lower layer.} The free functions are still public and
+      are what every \code{Tape} call turns into. Tests of their misuse
+      behaviour are not obsolete; they are the only thing holding it.
+\item \textbf{Cross-checking.} The suite compares the object path against the
+      free-function path bit-for-bit. Migrating the reference would make that
+      comparison compare the wrapper with itself.
+\end{itemize}
+
+So the answer is that they stay, as a documented lower layer.
+
+\chapter{Storage: the two arenas}
+\label{ch:arena}
+
+\section{Where the memory went}
+
+The original graph representation was two \code{std::map<largeint,Edge*>} per
+vertex. That cost 96 of the vertex's 120 bytes before a single edge existed, and
+every edge bought \emph{three} allocations: one for the \code{Edge} itself and
+two red-black tree nodes, one in each direction, each with the allocator's own
+header, scattered across the heap.
+
+Measured on one \code{heat\_assim} tape ($n_x{=}20$, $n_t{=}40$):
+
+\begin{center}
+\begin{tabular}{@{}lr@{}}
+\toprule
+what \code{get\_memory()} accounted & 728\,856 bytes \\
+what was actually on the heap       & 1\,780\,656 bytes \\
+\textbf{ratio}                      & \textbf{2.44$\times$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+So the memory budget --- the feature the whole checkpointing design exists to
+serve --- was wrong by a factor of two and a half. That is also why the budgets
+in the examples were magic numbers found by experiment: the model did not
+predict reality, so someone measured instead.
+
+The representation was replaced in three steps, each verified against the pinned
+invariants before the next began.
+
+\section{Step 1: the edge arena}
+
+Edges come from blocks and freed slots go on a free list, with the adjacency
+maps left exactly as they were. The smallest change that removes one of the
+three allocations per edge.
+
+\begin{lstlisting}
+Edge * EdgeArena::acquire( Vertex * src , Vertex * tgt , double eval )
+{
+  Edge * e = 0;
+
+  if( !free_list.empty() ){
+    e = free_list.back();
+    free_list.pop_back();
+  }else{
+    if( blocks.empty() || block_used==BLOCK ){
+      blocks.push_back( new Edge[BLOCK] );
+      slots += BLOCK;
+      block_used = 0;
+    }
+    e = blocks.back() + block_used;
+    block_used++;
+  }
+
+  e->eval = eval;  e->src = src;  e->tgt = tgt;
+  live++;
+  return e;
+}
+\end{lstlisting}
+
+Recycling was already the behaviour: \code{eliminate()} releases an in-edge and
+then allocates fill-in inside the same loop, so the allocator could always have
+handed back the block it had just freed. The free list makes that explicit
+rather than introducing it --- which is why the pinned Jacobians did not move.
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & before & after \\
+\midrule
+allocations per tape & 39\,462 & \textbf{27\,908} \\
+peak heap            & 1\,780\,720 B & \textbf{1\,559\,216 B} \\
+under-count ratio    & 2.44$\times$ & \textbf{2.14$\times$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+The 11\,554 allocations that disappeared are exactly the per-edge \code{new
+Edge}. What remained --- about 23\,000 tree nodes, two per edge --- confirmed the
+diagnosis: \emph{the map nodes were the bulk, not the \code{Edge} objects}.
+
+\section{Step 2: sorted adjacency}
+
+The two \code{std::map}s became one sorted array per vertex per direction. The
+choice of a sorted array over a linked list was made on the degree
+measurements: the direct-link probe scans a predecessor's out-list of 40 to 109
+entries, growing with problem size, so the search had to stay logarithmic.
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+ & original & after step 1 & \textbf{after step 2} \\
+\midrule
+allocations per tape & 39\,462 & 27\,908 & \textbf{17\,941} \\
+peak heap            & 1\,780\,720 & 1\,559\,216 & \textbf{820\,896} \\
+\code{sizeof(Vertex)} & 120 & 120 & \textbf{72} \\
+under-count ratio     & 2.44$\times$ & 2.14$\times$ & \textbf{1.63$\times$} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Peak memory down 54\% and allocations down 55\% from the start. All twelve
+\emph{structural} pinned values --- every Jacobian hash and every elimination
+cost --- were byte-for-byte identical. The \emph{accounting} column moved exactly
+as predicted, $5\to4$, $16\to11$, $4\to3$ chunks, because \code{sizeof(Vertex)}
+fell and the same byte budget therefore accounted for more graph. That split
+between structural and accounting values is what let a single test report
+``the derivative is unchanged and the partitioning moved'' rather than simply
+``failed''.
+
+\section{Step 3: the adjacency arena}
+
+The last per-vertex allocation. A \code{std::vector} adjacency was one
+allocation per vertex per direction the moment it became non-empty, plus a
+reallocation on every doubling, plus the doubling's slack --- and elimination
+creates and destroys vertices in the millions.
+
+This step had to wait for the tape object, and the reason is instructive. An
+arena needs somewhere to put the \emph{release}. A \code{Vertex} has no arena and
+giving it a back-pointer would have cost eight of the seventy-two bytes the
+arena exists to save. So \code{Process} owns the arena and is the only thing
+that destroys a vertex:
+
+\begin{lstlisting}
+void Process::retire( Vertex * v )
+{
+  if(!v) return;
+  v->in_edges.clear(adj_arena);
+  v->out_edges.clear(adj_arena);
+  delete v;
+}
+\end{lstlisting}
+
+\noindent
+and \code{\textasciitilde Vertex()} is deliberately empty, with a comment saying
+so, because an empty destructor that looks like an oversight is worse than no
+destructor at all.
+
+The arena carves fixed size classes from slabs and recycles them per class:
+
+\begin{lstlisting}
+AdjEntry * AdjArena::acquire( largeint want , largeint & cap )
+{
+  const largeint c = class_of(want);
+  cap = cap_of(c);
+  ...
+  if( !recycled[c].empty() ){
+    AdjEntry * p = recycled[c].back();
+    recycled[c].pop_back();
+    return p;
+  }
+
+  if( left[c] < cap ){
+    largeint slab = next_slab[c] ? next_slab[c] : SLAB_MIN;
+    if( slab < cap ) slab = cap;
+    AdjEntry * p = new AdjEntry[size_t(slab)];
+    slabs.push_back(p);
+    entries += slab;  cursor[c] = p;  left[c] = slab;
+    next_slab[c] = (slab<SLAB_MAX) ? slab*2 : SLAB_MAX;
+  }
+
+  AdjEntry * p = cursor[c];
+  cursor[c] += cap;  left[c] -= cap;
+  return p;
+}
+\end{lstlisting}
+
+\subsection*{Two parameter choices, both measured wrong first}
+
+This is worth recording in full, because both wrong choices looked right.
+
+\paragraph{Flat 4\,096-entry slabs.} The first attempt. It hit the target ---
+allocations fell 73\% --- and pushed \emph{peak heap up} by 20 to 32\%. A size
+class holding three blocks paid for all 64\,kB of its slab. Replaced with
+geometric growth per class.
+
+\paragraph{Geometric growth barely helped}, which was the useful surprise: the
+real cost was the \emph{minimum block size}. Classes started at four entries.
+But most vertices on a tape have in-degree one or two and out-degree one --- an
+elementary operation has one or two operands --- so the commonest allocation in
+the library was overshooting by two to four times, on the two blocks that
+\emph{every} vertex carries. Capacities start at one entry now, and that is
+where the win came from.
+
+Neither would have been found by reasoning about it. The first looked correct
+and was a regression; the second was invisible until the first was fixed.
+
+\subsection*{Result}
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+shape & allocations & peak heap \\
+\midrule
+12 vars $\times$ 40 steps & 9\,297 $\to$ \textbf{2\,564} ($-72\%$) & 425\,680 $\to$ \textbf{362\,640} ($-15\%$) \\
+20 vars $\times$ 25 steps & 9\,766 $\to$ \textbf{2\,707} ($-72\%$) & 639\,040 $\to$ \textbf{595\,360} ($-7\%$) \\
+20 vars $\times$ 40 steps & 15\,467 $\to$ \textbf{4\,213} ($-73\%$) & 876\,896 $\to$ \textbf{811\,568} ($-7\%$) \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+\code{sizeof(Vertex)} is still 72 --- \code{Adjacency} is a pointer and two
+counters, the same 24 bytes a \code{std::vector} occupied --- so
+\code{VERTEX\_BYTES} is unchanged and \emph{no chunk count moved}.
+
+The effect on wall time was larger than the memory figures suggest and was not
+anticipated. Reproducibly, across three runs:
+
+\begin{center}
+\begin{tabular}{@{}lrr@{}}
+\toprule
+ & before & after \\
+\midrule
+whole tape          & 13.8 -- 15.4\,ms & \textbf{5.4 -- 5.7\,ms} \\
+chunked, 200\,kB    & 22.3 -- 23.5\,ms & \textbf{14.7 -- 15.2\,ms} \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+That is $2.5\times$ on an allocation-heavy tape. It is a reminder that
+allocation count, not resident bytes, was the dominant cost all along.
+
+\chapter{Concurrency}
+\label{ch:threads}
+
+\section{What is shared}
+
+One object at namespace scope in the whole library is mutable, and it is
+\code{thread\_local}. Everything else static is \code{const}: two size
+constants, one mathematical constant, and the arena class parameters. Every
+piece of state a recording touches --- the graph, both arenas, the counters, the
+shadow buffers, the 2-D dimensions --- lives in the \code{TapeState} that
+\svegp{26} collected them into.
+
+\section{What works}
+
+Independent tapes on separate threads. Verified under ThreadSanitizer:
+
+\begin{itemize}
+\item 4 threads $\times$ 25 tapes each, half of them chunking hard so
+      \code{BreakException} unwinds on several threads simultaneously: no races,
+      every derivative correct.
+\item 8 threads $\times$ 6 rounds, each round building a deep tape three ways
+      --- object surface whole, object surface chunked at 3\,000 bytes, and the
+      free functions at 4\,000 --- and cross-checking all three: zero
+      disagreements, no races. The free functions are as thread-safe as the
+      object surface, because they go through the same thread-local pointer.
+\item \textbf{Negative control:} one \code{Tape} object driven from two threads
+      races immediately, reported in \code{Tape::enter\_()} and
+      \code{independents()}. The boundary is where it should be, and the
+      sanitizer says so loudly rather than corrupting quietly.
+\end{itemize}
+
+Measured speedup over 16 independent tapes on 2 cores:
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+budget & serial & parallel & speedup \\
+\midrule
+whole tape & 90.6\,ms & 50.7\,ms & $1.79\times$ \\
+200\,kB    & 247.3\,ms & 129.0\,ms & $1.92\times$ \\
+50\,kB     & 308.4\,ms & 157.4\,ms & $1.96\times$ \\
+12\,kB     & 561.7\,ms & 281.1\,ms & $2.00\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Efficiency improves slightly at tighter budgets, because replay is pure
+per-thread arithmetic while recording contends on the allocator.
+
+The memory trade is milder than it first appears. With a fixed 200\,kB pool: one
+thread at 200\,kB is 15.4\,ms per tape; two threads at 100\,kB each is about
+16.4\,ms per tape, two at a time, for an effective 8.2\,ms --- $1.88\times$.
+Roughly 94\% of two cores survives halving the budget.
+
+\section{What does not work, and why}
+
+Parallelising \emph{across partitions} is not available, and the obstacle is
+architectural rather than mechanical. Three reasons, worst first.
+
+\paragraph{Value dependency.} Partition $k$'s inputs are the program state after
+partitions $1..k-1$ have executed. The replay design exists precisely because
+that state is never stored. Building partitions concurrently means checkpointing
+the \emph{values} at boundaries --- which is the ``spill the tape rather than
+replay the program'' alternative, a different design with different costs, not a
+parallelisation of this one.
+
+\paragraph{Elimination order.} Each pass folds its partition into the
+accumulating result, last to first, each step consuming what came before.
+Chapter~\ref{ch:elim} showed that elimination order changes the result in the
+last bits. Reordering or interleaving partitions therefore changes the Jacobian,
+destroying the bit-exactness across budgets that has twelve pinned witnesses ---
+which is the property that makes chunking trustworthy in the first place.
+
+\paragraph{Shared recording state.} \code{next\_vertex\_idx},
+\code{intmed\_vec}, the partition-boundary logic and both arenas are per-tape,
+not per-thread. Lockable --- but locking makes index assignment
+nondeterministic, which returns to the previous paragraph.
+
+The same three apply to placing an OpenMP loop \emph{inside} a section. Making
+that work would need per-thread sub-tapes with index ranges reserved during the
+profiling pass --- which already counts everything, so it could hand out
+deterministic ranges --- followed by a merge. That is a substantial design, and
+it only pays if the section contains genuinely independent work, which a deep
+time-stepping tape does not.
+
+\paragraph{One avenue remains open.} Recording partition $k+1$ and eliminating
+partition $k$ are order-independent: recording needs values, not the elimination
+result. A two-stage pipeline would preserve the accumulation chain. Its ceiling
+is the smaller of the two phases, which has not been measured, and it would
+require the arenas to be split per stage. It is noted here as the one form of
+intra-tape parallelism the architecture does not forbid.
+
+\section{A caveat on diagnostics}
+
+Diagnostics go to \code{std::cerr} unsynchronised. That is not a data race ---
+the standard stream objects are safe --- but two threads misusing the API
+simultaneously will interleave their messages mid-line.
+
+\chapter{Verification}
+\label{ch:verify}
+
+The way this library is tested is itself a design choice, and the report would
+be incomplete without it.
+
+\section{Structural values and accounting values}
+
+\code{examples/invariants} freezes what the library computes across twelve cases
+and five tape shapes, and pins \emph{two kinds} of number:
+
+\begin{itemize}
+\item \textbf{Structural} --- the elimination cost, and a bit-exact FNV-1a hash
+      of every harvested Jacobian entry. These are properties of the graph and
+      the arithmetic. They must never move.
+\item \textbf{Accounting} --- the partition count. This is \emph{expected} to
+      move when the memory model changes, and is pinned so that the move is
+      deliberate.
+\end{itemize}
+
+The split earns its keep every time the representation changes. A single-column
+test would have reported a failure at step 2 of the arena work and told you
+nothing about whether the derivative had changed.
+
+The hash is a refactoring change-detector, not a portable golden value, so the
+example compiles with \code{-ffp-contract=off}: otherwise the compiler may fuse
+\code{a*b+c} into an FMA depending on the optimisation level, and the hash would
+track \code{-O} rather than the library.
+
+\section{Controls}
+
+\emph{A test that has never failed is not known to work.} Every assertion added
+during this work was checked by deliberately breaking the thing it guards:
+
+\begin{center}
+\begin{longtable}{@{}p{7.2cm}p{7.2cm}@{}}
+\toprule
+control & observed \\
+\midrule
+\endhead
+reverse the out-edge iteration order & nothing --- correctly \\
+drop fill-in edges below $10^{-12}$ & 1 case, on \emph{cost} \\
+perturb every partial by 1 ulp & all 12, on \emph{hash} \\
+revert \svegp{24} (uncount adjacency) & chunk column, and the drift band \\
+\code{\textasciitilde Process()} emptied & LeakSanitizer, 560 bytes in 12 allocations \\
+\code{run()} stops catching \code{BreakException} & abort, exit 134 \\
+object-owned guard removed from \code{finalize()} & ASan \code{heap-use-after-free} \\
+\code{leave\_()} stops restoring & the nested-tape case fails \\
+\code{set\_current\_tape} made a singleton again & all three two-tape assertions fail \\
+off-by-one in the arena's block capacity & ASan \code{heap-use-after-free} \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\noindent
+Two entries in that table are the most valuable. The first --- reversing
+adjacency order and observing \emph{nothing} --- is a finding, not a null
+result: it disproved a constraint the design had assumed and freed the storage
+layout. And one control that was run \emph{did not} fail: removing the
+current-tape restore from \code{\textasciitilde Tape()} breaks nothing, because
+every scope pairs its enter with its leave even while an exception unwinds. That
+line stays as belt-and-braces, and the code comment says plainly that the suite
+does not cover it. Recording a control that passed is as useful as recording one
+that failed.
+
+\section{Sanitizers}
+
+\code{make sanitize} rebuilds into a \emph{separate} tree under AddressSanitizer
+and LeakSanitizer. The separate tree is deliberate: \code{make} compares
+timestamps only, so sanitizing in place leaves every binary newer than its
+source and a following plain \code{make} rebuilds nothing --- you keep running
+instrumented code without being told, which is how a fast example comes to look
+like a hang.
+
+\section{What the suite asserts}
+
+\begin{center}
+\begin{tabular}{@{}lp{9.2cm}@{}}
+\toprule
+example & what it holds \\
+\midrule
+\code{invariants} & 12 pinned structural values; the accounting drift band \\
+\code{fdcheck}    & 68 finite-difference checks of every elementary function \\
+\code{regress}    & every fixed defect, both API surfaces, budget invariance \\
+\code{bratu}      & the 2-D checkpoint overload; asserts chunking \\
+\code{heat}       & a 107-partition tape; asserts chunking \\
+\code{heat\_assim}& adjoint vs finite differences; elimination direction; CG \\
+\code{hybrdj1}    & a full $20\times20$ Jacobian; asserts chunking \\
+\code{pinn}       & 2\,502 tapes; chunked gradient equals unchunked reference \\
+\code{test\_xor}  & 4\,001 tapes; AD gradient vs central differences \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\part{Using the Library}
+
+\chapter{Getting started}
+
+\section{Building}
+
+\begin{lstlisting}[language=bash]
+make            # the library and every example, into build/
+make test       # build, then run the whole suite in order
+make list       # the examples and the arguments they run with
+make sanitize   # rebuild into build-asan/ under ASan+LSan, run the suites
+make clean      # remove build/ and build-asan/
+\end{lstlisting}
+
+Everything generated lands under \code{build/}: \code{build/lib/libmaxwell.a},
+\code{build/obj/}, and one binary per example in \code{build/bin/}. Nothing is
+written into the source tree.
+
+A single example builds standalone from a cold tree --- \code{cd examples/pinn
+\&\& make} recurses into \code{src/} first --- and \code{cd src \&\& make} builds
+the library on its own.
+
+\section{Including it}
+
+\begin{lstlisting}
+#include "maxwell.hpp"
+
+using namespace maxwell;   // or qualify: maxwell::active, maxwell::sin
+\end{lstlisting}
+
+The header does not open the namespace for you. It brings in the \code{active}
+scalar, the free-function API, \code{Tape} and \code{Jacobian}, and
+\code{BreakException} --- and deliberately nothing internal, so the graph
+representation can change underneath you without your code changing. It has,
+twice.
+
+\section{The shape of a program}
+
+\begin{lstlisting}
+#include "maxwell.hpp"
+using namespace maxwell;
+
+int main()
+{
+  const double x0[2] = { 1.1 , 2.3 };
+
+  Tape t( 2 , 1 , 1u<<20 );          // 2 independents, 1 dependent, 1 MB budget
+
+  active * x = t.independents(x0);   // the tape's own, values set and registered
+  active y;
+
+  t.run( y , [&]{ y = sin(x[0]*x[1]); } );
+
+  t.dependent(y);
+
+  Jacobian J = t.harvest();
+
+  std::printf("dy/dx0 = %.10f\n", J(0,0));
+  return 0;
+}
+\end{lstlisting}
+
+Five calls. The constructor opens the tape and the closing brace closes it, on
+every path out of the block including a \code{return} or a \code{throw}.
+
+\chapter{The tape surface}
+
+\section{Construction}
+
+\begin{lstlisting}
+Tape t( n , m , memory_budget );
+\end{lstlisting}
+
+$n$ independents, $m$ dependents, and a budget \emph{in bytes}. The budget is
+what the library may hold as graph payload; see Section~\ref{sec:budget} for how
+to choose it. A \code{Tape} is not copyable --- it owns a graph.
+
+\section{Independents}
+\label{sec:independents}
+
+\begin{lstlisting}
+active *  independents( const double * x0 );
+active ** independents( largeint rows , largeint cols , const double * x0 );
+\end{lstlisting}
+
+The tape hands back its own independents, with the values already in them and
+already registered. This replaces three steps that had to agree with each other
+--- declare, set values, register in the same order --- with one, and it closes
+the bounds error that \svegp{18} was about.
+
+The storage belongs to the tape and is sized exactly once, so the reallocating
+\code{std::vector<active>} hazard of Section~\ref{sec:pitfalls} cannot happen to
+it. The returned pointer is valid until the \code{Tape} dies; do not
+\code{delete} it.
+
+The 2-D form takes \code{rows} and \code{cols} in the order the indices are
+written, \code{x[i][j]} with $i$ over rows, and reads \code{x0} row-major. The
+underlying \code{set\_indep\_dimension} takes them the other way round, columns
+first; that transposition is \svegp{17}, it is invisible on a square grid, and
+it is now made inside the library where a caller cannot get it wrong.
+
+\section{Running the section}
+
+\begin{lstlisting}
+template<class Body> void run( active  & y , Body body );   // one dependent
+template<class Body> void run( active  * y , Body body );   // m dependents
+template<class Body> void run( active ** y , Body body );   // a rows x cols grid
+\end{lstlisting}
+
+\code{run} drives the checkpoint loop to completion and owns the
+\code{try}/\code{catch}. Call it after \code{independents()} and before
+\code{dependents()}. For the 2-D form, call \code{dependent\_shape(rows,cols)}
+first --- \code{checkpoint} reads the dependent shape on its first pass, so it
+cannot be inferred later.
+
+\section{Dependents, harvest, and the rest}
+
+\begin{lstlisting}
+void dependent ( const active & y );      // one
+void dependents( const active * y );      // m of them
+void dependents( active ** y );           // the dependent_shape() grid
+
+Jacobian harvest( bool print_out = false );
+
+largeint partitions();          // how many chunks; 1 means it never chunked
+largeint cost();                // elimination cost, in multiply-adds
+largeint memory();              // graph payload in bytes, by the budget's model
+void     set_elim_mode( elim_t mode );   // before run(); default REVERSE_ELIM
+\end{lstlisting}
+
+\section{The Jacobian}
+
+\begin{lstlisting}
+class Jacobian
+{
+public:
+  largeint rows() const;
+  largeint cols() const;
+  bool     empty() const;                       // harvest() refused
+  double   operator()( largeint i , largeint j ) const;
+  double & operator()( largeint i , largeint j );
+  ...
+};
+\end{lstlisting}
+
+A value, stored as one flat row-major block. Copying one copies it; there is
+nothing to free. \code{empty()} is true when \code{harvest()} refused --- a
+shape mismatch, or a program that never drove \code{run()} --- and it is worth
+checking, because it is the one way the call can decline.
+
+\chapter{The checkpoint contract}
+
+This chapter is short and is the most important one in Part~II.
+
+\medskip
+\noindent
+The code inside \code{run()} is executed \textbf{$1+N$ times}, where $N$ is the
+number of partitions and is not known until the first pass has finished. It may
+also be \textbf{abandoned part-way} by an exception thrown from inside an
+arithmetic operator. Your section must therefore be:
+
+\paragraph{Re-runnable.} Same inputs, same result, every time. The library
+restores the independents between passes; anything else your section reads must
+not have changed.
+
+\paragraph{Side-effect free.} The profiling pass runs your section an extra
+time. Printing from inside a section prints $N+1$ times. Drawing a random number
+inside a section draws a different one on each pass and silently breaks
+re-runnability --- put the RNG \emph{outside}, as \code{examples/pinn} does.
+
+\paragraph{Exception-safe.} \code{run()} owns the \code{try}/\code{catch}, so
+you cannot forget it or catch the wrong thing --- but an exception still unwinds
+through \emph{your} code. Anything held in a raw pointer between the start of
+the section and the throw point is leaked. Use containers, or let the section
+own nothing:
+
+\begin{lstlisting}
+// WRONG: leaks nx+1 actives on every partition boundary
+active * old = new active[nx+1];
+...
+delete [] old;                       // never reached when BreakException fires
+
+// RIGHT
+std::vector<active> old(nx+1);       // sized once; destructor runs while unwinding
+\end{lstlisting}
+
+\noindent
+That exact defect --- raw \code{new[]} buffers swapped by pointer, leaking on
+every break, thousands of times across a conjugate-gradient run --- is a real one
+from this library's history, and nothing would have caught it but a sanitizer.
+
+\chapter{Choosing a budget}
+\label{sec:budget}
+
+\section{What the number means}
+
+The budget is bytes of \emph{graph payload}: vertices at
+\code{sizeof(Vertex)} = 72 and edges at \code{sizeof(Edge)} + 2\,$\times$\,
+\code{sizeof(AdjEntry)} = 56. It deliberately excludes allocator overhead and
+container slack, because those are not knowable during the profiling pass, when
+the decision is made. Expect the process to hold roughly 1.5 to 1.9 times the
+budget --- \code{examples/invariants} measures that ratio on every run and fails
+if it drifts.
+
+\section{How to pick one}
+
+Start with the memory you can afford, divided by about 1.7. Then check what you
+got:
+
+\begin{lstlisting}
+Jacobian J = t.harvest();
+std::printf("tape broken into %lu chunk(s)\n", (unsigned long)t.partitions());
+\end{lstlisting}
+
+\code{partitions()==1} means the budget was never reached and the checkpoint
+machinery never fired. That is the right answer for a small problem, and a
+warning sign for a large one --- it means you are holding the whole tape.
+
+\section{What chunking costs}
+
+From Section~\ref{sec:replaycost}: 8 partitions cost $2.7\times$ the whole-tape
+time, 29 cost $3.2\times$, 121 cost $6.3\times$. The elimination work is
+identical in every case; the growth is entirely the replay of your section.
+
+So the ordering of remedies for a slow differentiation is:
+
+\begin{enumerate}
+\item raise the budget if the memory exists --- this is by far the largest lever;
+\item choose the elimination direction (Section~\ref{sec:direction});
+\item run independent tapes on separate threads (Section~\ref{sec:parallel}),
+      worth up to the core count, and slightly less because each tape then gets
+      a smaller share of memory.
+\end{enumerate}
+
+\section{Elimination direction}
+\label{sec:direction}
+
+\begin{lstlisting}
+Tape t(n,m,budget);
+t.set_elim_mode(REVERSE_ELIM);      // the default
+// t.set_elim_mode(FORWARD_ELIM);
+\end{lstlisting}
+
+Must be set before \code{run()}. Both directions produce the same Jacobian ---
+to within the last bits, since they accumulate in different orders --- at very
+different cost. Reverse wins on a deep narrow tape, and the gap grows with
+depth: \code{examples/heat\_assim} measures $6\,835$ multiply--adds reverse
+against $112\,102$ forward, a $16.4\times$ ratio, on the same graph. Forward can
+win when there are few independents and many dependents. \code{cost()} reports
+the figure, so the honest way to choose is to measure both once on a
+representative problem.
+
+\chapter{Use cases}
+
+Six worked cases, each taken from a shipped example that runs under
+\code{make test}.
+
+\section{A gradient: many inputs, one output}
+
+The commonest case in optimisation and machine learning. With one dependent,
+the $1\times n$ Jacobian \emph{is} the gradient.
+
+\begin{lstlisting}
+static double gradient( const double * w , double * g , largeint mem )
+{
+  Tape t( largeint(NP) , 1 , mem );
+
+  active * p = t.independents(w);
+  active L;
+
+  t.run( L , [&]{ L = mse(p); } );
+
+  t.dependent(L);
+
+  Jacobian J = t.harvest();
+  if(J.empty()){ return 0.0; }
+
+  for( int i=0 ; i<NP ; i++ ) g[i] = J(0,i);
+
+  return passive_value(L);        // the loss, as a plain double
+}
+\end{lstlisting}
+
+\noindent
+\emph{From \code{examples/test\_xor}, which trains a 2--4--1 network on XOR for
+4\,001 epochs, one tape per epoch, 8 partitions each.} Note what the signature
+says: parameters go in as \code{double} and come back as \code{double}. They are
+active only \emph{inside} the tape. That matters --- see
+Section~\ref{sec:pitfalls}.
+
+The gradient is checked against central differences on an independently written
+plain-\code{double} forward pass, which is the only way such a check proves
+anything: if both sides were the same code, agreement would be meaningless.
+
+\section{A full Jacobian: $n$ inputs, $n$ outputs}
+
+\begin{lstlisting}
+Tape t( n , n , budget );
+
+std::vector<double> x0(n,-1.0);
+active * x = t.independents( &x0[0] );
+
+active * fvec = new active[n];
+
+t.run( fvec , [&]{ fcn(n,x,fvec); } );
+
+t.dependents(fvec);
+
+Jacobian J = t.harvest(true);     // true keeps the FJAC listing
+
+const double want = 3.0 - 4.0*(-1.0);
+for( int k=0 ; k<n ; k++ ) assert( J(k,k)==want );
+\end{lstlisting}
+
+\noindent
+\emph{From \code{examples/hybrdj1}, MINPACK's \code{hybrj1} test function at
+$n=20$, tape broken into 18 chunks.} The dependents here are the caller's own
+array, not the tape's --- only the independents come from the tape.
+
+\section{A two-dimensional grid}
+
+When the natural indexing is \code{x[i][j]}, the tape can hand out a grid:
+
+\begin{lstlisting}
+std::vector<double> x0(n*n,0.0);
+... fill x0 row-major, boundary conditions and all ...
+
+Tape t( n*n , n*n , (largeint)bs );
+
+active ** x = t.independents( n , n , &x0[0] );
+t.dependent_shape( n , n );
+
+t.run( x , [&]{ bratu(n,x,r); } );    // x is both independent and dependent
+t.dependents(x);
+\end{lstlisting}
+
+\noindent
+\emph{From \code{examples/bratu}, a 2-D Bratu discretisation on a $50\times50$
+grid at a 400\,kB budget, 13 chunks.} The independents are also the dependents
+here, which is legal and common for an iterated map.
+
+This is the shape \svegp{17} lived in. Because \code{bratu} is square, it could
+never have exposed the bug; the regression suite drives a deliberately
+non-square $3\times2$ grid for that reason.
+
+\section{An adjoint: data assimilation}
+
+A deep tape --- the whole point of the library.
+
+\begin{lstlisting}
+static double gradient( const double * w , const double * obs , double * g ,
+                        elim_t mode , largeint mem )
+{
+  Tape t( largeint(NP) , 1 , mem );
+  t.set_elim_mode( mode );
+
+  active * p = t.independents(w);
+  active Jc;
+
+  t.run( Jc , [&]{ Jc = cost_active(p,obs); } );
+
+  t.dependent(Jc);
+
+  const double value = passive_value(Jc);
+
+  Jacobian J = t.harvest();
+  for( int i=0 ; i<NP ; i++ ) g[i] = J(0,i);
+
+  return value;
+}
+\end{lstlisting}
+
+\noindent
+\emph{From \code{examples/heat\_assim}: a 1-D heat equation marched 40 steps,
+with the initial condition as the control and 36 observations as data. The cost
+functional's gradient is the adjoint.} The example then drives linear conjugate
+gradient with exact Hessian-vector products obtained by differencing the AD
+gradient, and recovers the initial condition to an rms error of
+$1.0\times10^{-13}$ over 19 controls, taking the cost from $7.71$ to
+$3.6\times10^{-29}$.
+
+The tape here is 40 time steps chained end to end and is eliminated whole rather
+than per partition --- which is what makes the $16.4\times$ reverse-versus-forward
+ratio visible.
+
+\section{Verifying a derivative}
+
+Never trust an AD result you have not checked once. The pattern:
+
+\begin{lstlisting}
+Tape t(1,1,1u<<30);
+active * x = t.independents(&x0);
+active y;
+t.run( y , [&]{ y = f(x[0]); } );
+t.dependent(y);
+Jacobian J = t.harvest();
+const double ad = J.empty() ? NAN : J(0,0);
+
+const double h  = 1e-6;
+const double fd = ( f_passive(x0+h) - f_passive(x0-h) ) / (2.0*h);
+
+assert( std::fabs(ad-fd)/(1.0+std::fabs(fd)) < 2e-5 );
+\end{lstlisting}
+
+\noindent
+\emph{From \code{examples/fdcheck}, which does this for every elementary function
+the library overloads --- 68 checks, zero failures.} Use a generous tolerance:
+you are checking the AD, and the finite difference is the inaccurate side.
+
+\section{Independent tapes in parallel}
+\label{sec:parallel}
+
+Each thread builds its own tape. Nothing is shared, and no library call is
+needed to arrange it:
+
+\begin{lstlisting}
+#pragma omp parallel for schedule(static)
+for( int i=0 ; i<NCASE ; i++ ){
+  Tape t( n , 1 , budget );
+  active * x = t.independents(&starts[i*n]);
+  active y;
+  t.run( y , [&]{ y = f(x); } );
+  t.dependent(y);
+  Jacobian J = t.harvest();
+  for( int j=0 ; j<n ; j++ ) out[i*n+j] = J(0,j);
+}
+\end{lstlisting}
+
+Measured $1.79$ to $2.00\times$ on two cores, verified race-free under
+ThreadSanitizer. Natural fits: finite-difference Hessians ($n$ independent
+gradient evaluations), parameter sweeps, multi-start optimisation, ensembles,
+and verification suites.
+
+\paragraph{The one rule.} A \code{Tape} object belongs to one thread. Sharing
+one across threads races immediately --- ThreadSanitizer reports it in
+\code{Tape::enter\_()} --- and there is no locking mode that makes it safe,
+because index assignment would become nondeterministic and the Jacobian would
+stop being reproducible.
+
+\paragraph{And the caveat.} $P$ parallel tapes need $P$ times the memory.
+Checkpointing exists to bound memory, so this trades back some of what it buys.
+The trade is mild --- halving the budget to double the threads keeps about 94\%
+of the second core --- but it is real.
+
+\chapter{Pitfalls}
+\label{sec:pitfalls}
+
+\section{\code{active} is not a value type}
+
+Copying one records a vertex and an edge. Usually that is invisible. It stops
+being invisible in a container that reallocates:
+
+\begin{lstlisting}
+// 5.5x the tape it should be: 15 reallocation copies, each recording
+std::vector<active> h;
+for( int i=0 ; i<8 ; i++ ) h.push_back( something(i) );
+
+// fine: sized once, no element ever copied
+std::vector<active> h(8);
+for( int i=0 ; i<8 ; i++ ) h[i] = something(i);
+\end{lstlisting}
+
+\noindent
+The derivative is correct either way. The tape is five and a half times bigger,
+which changes how many partitions you get and how long it takes, and nothing
+warns. \emph{Size your containers once, or reserve.}
+
+\section{Do not hold actives across tapes}
+
+An \code{active} that outlives its tape carries an index into a graph that has
+been given back. Keep long-lived state --- optimiser parameters, iterates,
+anything that survives a tape --- as \code{double}, and let
+\code{t.independents()} make it active for the duration:
+
+\begin{lstlisting}
+// WRONG
+active * p = new active[NP];
+for( int e=0 ; e<epochs ; e++ ){ gradient(p,g,mem); for(...) p[i] = w[i]; }
+
+// RIGHT
+double * w = new double[NP];
+for( int e=0 ; e<epochs ; e++ ){ gradient(w,g,mem); for(...) w[i] -= lr*g[i]; }
+\end{lstlisting}
+
+\noindent
+Three shipped examples did the first thing and were changed to do the second.
+
+\section{Do not mix the two surfaces}
+
+Calling \code{finalize()} from inside a \code{Tape} section would free the state
+the object still points at. The library refuses and says so, rather than letting
+it happen --- but the diagnostic means your program is doing something it should
+not.
+
+\section{The budget is bytes}
+
+Not kilobytes, not a multiplier, not a number of time steps. One example
+historically took a multiplier and it silently meant a different thing at every
+grid size; it takes bytes now, and rejects an implausibly small value rather
+than chunking on every operation and appearing to hang.
+
+\section{Check \code{empty()}}
+
+\code{harvest()} returns an empty \code{Jacobian} rather than crashing when it
+refuses --- a transposed shape, or a program that never drove \code{run()}. If
+you index it without checking, you get zeros rather than a diagnostic.
+
+\appendix
+
+\chapter{Defect log}
+
+Defects found and fixed during the 2026 audit, referred to throughout by
+number. Numbering starts at 16; earlier numbers belong to the pre-audit history.
+
+\begin{center}
+\begin{longtable}{@{}lp{12.4cm}@{}}
+\toprule
+id & summary \\
+\midrule
+\endhead
+\svegp{03} & harvest wrote the Jacobian column at the independent's vertex index rather than its position \\
+\svegp{04} & harvest did nothing while still profiling, leaving the caller's pointer uninitialised \\
+\svegp{05} & the requested Jacobian shape was trusted; a transposed request overran the heap \\
+\svegp{06} & harvest printed unconditionally; \code{printf} with a non-literal format and \code{largeint} in \code{\%4d} \\
+\svegp{07} & no way to release the harvested \code{double**}; every harvest leaked \\
+\svegp{16} & \code{operator>=} declared but never defined --- a link failure \\
+\svegp{17} & the 2-D checkpoint flattened rows with the wrong stride; heap overflow on any non-square grid \\
+\svegp{18} & \code{independent()}/\code{dependent()} unguarded; null deref and heap overflow \\
+\svegp{19} & \code{forward\_elimination()}/\code{reverse\_elimination()} never eliminated anything \\
+\svegp{20} & uninitialised \code{Vertex*} handed to \code{add\_edge()} \\
+\svegp{21} & \code{Process::mem\_size} never initialised \\
+\svegp{22} & the partition count was not observable from the public API \\
+\svegp{23} & the elimination direction was not selectable \\
+\svegp{24} & the memory accounting never counted adjacency; every edge under-charged by more than half \\
+\svegp{25} & one example's budget was a multiplier of a stale, undocumented unit \\
+\svegp{26} & two parallel global states that had to agree; replaced by one tape object \\
+\svegp{27} & \code{Process} had no destructor; a tape released other than through \code{finalize()} leaked its graph \\
+\svegp{28} & the RAII surface: \code{Tape} and \code{Jacobian} \\
+\svegp{29} & a tape re-entered from inside its own section restored the wrong predecessor \\
+\svegp{30} & the adjacency arena \\
+\bottomrule
+\end{longtable}
+\end{center}
+
+\noindent
+Still open by choice: \svegp{10}, an API call-order state machine that was
+written and never wired in. An out-of-order call is diagnosed but not made
+unrepresentable, except where the \code{Tape} surface makes it so.
+
+\chapter{Measurement summary}
+
+All figures GCC 13.3.0, \code{-O2}, x86-64.
+
+\section{Graph representation}
+
+\begin{center}
+\begin{tabular}{@{}lrrrr@{}}
+\toprule
+ & original & edge arena & sorted adjacency & adjacency arena \\
+\midrule
+allocations / tape    & 39\,462 & 27\,908 & 17\,941 & $-72\%$ further \\
+peak heap (bytes)     & 1\,780\,720 & 1\,559\,216 & 820\,896 & $-7$ to $-15\%$ further \\
+\code{sizeof(Vertex)} & 120 & 120 & 72 & 72 \\
+accounting ratio      & 2.44$\times$ & 2.14$\times$ & 1.63$\times$ & 1.51--1.56$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Cost of chunking}
+
+16 variables, 120 steps, $\approx$1\,920 recorded operations.
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+budget & partitions & time & replay share \\
+\midrule
+no AD at all & --- & 0.0085\,ms & --- \\
+whole tape   & 1   & 5.78\,ms   & --- \\
+200\,kB      & 8   & 15.40\,ms  & 62\% \\
+50\,kB       & 29  & 18.35\,ms  & 68\% \\
+12\,kB       & 121 & 36.40\,ms  & 84\% \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Parallel independent tapes, 2 cores}
+
+\begin{center}
+\begin{tabular}{@{}lrrr@{}}
+\toprule
+budget & serial & parallel & speedup \\
+\midrule
+whole tape & 90.6\,ms & 50.7\,ms & 1.79$\times$ \\
+200\,kB & 247.3\,ms & 129.0\,ms & 1.92$\times$ \\
+50\,kB & 308.4\,ms & 157.4\,ms & 1.96$\times$ \\
+12\,kB & 561.7\,ms & 281.1\,ms & 2.00$\times$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\section{Suite status}
+
+\begin{center}
+\begin{tabular}{@{}ll@{}}
+\toprule
+example & result \\
+\midrule
+\code{invariants} & PASS --- 12 structural values pinned; drift 1.51--1.56$\times$ \\
+\code{fdcheck}    & 0 failures of 68 \\
+\code{regress}    & PASS, 0 failures \\
+\code{bratu}      & 13 chunks \\
+\code{heat}       & 107 chunks \\
+\code{heat\_assim}& PASS --- rms $1.001\times10^{-13}$ over 19 controls \\
+\code{hybrdj1}    & 18 chunks \\
+\code{pinn}       & PASS --- 2\,502 tapes \\
+\code{test\_xor}  & PASS --- 4\,001 tapes, 8 chunks each \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+\noindent
+Zero warnings from a clean build under \code{-Wall -Wextra}; clean under
+AddressSanitizer and LeakSanitizer.
+
+\chapter{Known limitations}
+
+\paragraph{No second derivatives.} A Hessian requires a tape whose edge weights
+are themselves \code{active}, which requires the scalar type to be templated.
+This is the largest change remaining and is not begun. Where an exact Hessian is
+needed today, difference the AD gradient --- \code{examples/heat\_assim} does
+exactly that, and its symmetry check agrees to $1.4\times10^{-11}$.
+
+\paragraph{No parallelism within a tape.} Chapter~\ref{ch:threads} gives the
+three reasons. Independent tapes parallelise; partitions do not.
+
+\paragraph{The copy cost of \code{active} is undocumented in the header.} It is
+described in this report and mitigated for independents, but a user who writes
+the obvious growing-container pattern still pays silently.
+
+\paragraph{Two counters share a name.} \code{Process::run\_counter} (productive
+re-runs) and \code{TapeState::run\_counter} (replay position) are different
+quantities with the same name inside what is now one object. Not a defect; a
+consolidation waiting to happen.
+
+\paragraph{\code{APICallState} is still not wired in.} An out-of-order
+free-function call is diagnosed at runtime rather than made impossible. The
+\code{Tape} surface makes most such orderings unrepresentable, which is the
+better answer, but the free functions remain public.
+
+\end{document}

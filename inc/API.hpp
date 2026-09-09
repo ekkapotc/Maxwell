@@ -70,6 +70,25 @@ namespace maxwell
    */
   void set_elim_mode( elim_t mode );
 
+  /*
+   * SVEGP-32 : choose how a pass ends once its target partition is recorded --
+   * by throwing BreakException (BREAK_ON_TARGET, the default and what the
+   * library has always done) or by letting the section run to completion
+   * (RUN_TO_END).  Same partitions, same Jacobian, same elimination cost;
+   * RUN_TO_END executes about twice the passive work and in exchange never
+   * abandons the caller's section mid-operator, so nothing the section
+   * allocated is stranded and no throw has to cross a frame that cannot carry
+   * one.  See break_t in Typedefs.hpp.
+   *
+   * Like set_elim_mode(), must be called AFTER initialize() and before the
+   * checkpoint loop: finalize() destroys the Process that holds the setting.
+   *
+   * Under RUN_TO_END the caller's try/catch around the section becomes dead
+   * code rather than wrong -- nothing is thrown -- so an existing caller need
+   * not remove it.
+   */
+  void set_break_mode( break_t mode );
+
   void set_indep_dimension( largeint indep_x_dim , largeint indep_y_dim );
   
   void set_dep_dimension( largeint dep_x_dim , largeint dep_y_dim );

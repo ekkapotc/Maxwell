@@ -219,6 +219,20 @@ public:
   //must be called before run(); the default is REVERSE_ELIM
   void set_elim_mode( elim_t mode );
 
+  /*
+   * SVEGP-32 : how a pass ends once its target partition is recorded.  Must be
+   * called before run(); the default is BREAK_ON_TARGET, which is what the
+   * library has always done.
+   *
+   * RUN_TO_END retires the third of run()'s three requirements on the caller
+   * documented above.  The section is no longer aborted at an arbitrary
+   * operator, so it does not have to be exception-safe, and nothing it
+   * allocated before the abort point is stranded once per pass.  Re-runnable
+   * and side-effect free are still the caller's.  The try/catch inside run()
+   * stays either way; under RUN_TO_END it simply never fires.
+   */
+  void set_break_mode( break_t mode );
+
 private:
 
   /*

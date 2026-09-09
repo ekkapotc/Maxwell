@@ -11,6 +11,7 @@ using namespace maxwell::internals;
 /* ------------------------------------------------------ SVEGP-30, 4d ----- */
 
 AdjArena::AdjArena():
+slab_max(SLAB_CAP),
 entries(0)
 {
   for( largeint c=0 ; c<NCLASS ; c++ ){
@@ -23,6 +24,28 @@ entries(0)
 AdjArena::~AdjArena()
 {
   clear();
+}
+
+/*
+ * SVEGP-31.  A chunk of `bytes` holds at most bytes/EDGE_BYTES edges and each
+ * edge occupies two adjacency entries, so 2*bytes/EDGE_BYTES entries is the
+ * whole chunk's adjacency.  Those entries are spread over several size
+ * classes, so allowing every class a slab that large would overshoot; a
+ * quarter of it per class keeps the total in the region of one chunk while
+ * still amortising the busy classes.  SLAB_MIN remains the floor.
+ */
+void AdjArena::set_budget( largeint bytes )
+{
+  if(!slabs.empty()) return;
+
+  const largeint per_edge = largeint(sizeof(Edge)) + 2*largeint(sizeof(AdjEntry));
+
+  largeint want = (bytes>0) ? ( (2*bytes/per_edge) / 4 ) : SLAB_CAP;
+
+  if( want < SLAB_MIN ) want = SLAB_MIN;
+  if( want > SLAB_CAP ) want = SLAB_CAP;
+
+  slab_max = want;
 }
 
 largeint AdjArena::class_of( largeint want )
@@ -76,7 +99,7 @@ AdjEntry * AdjArena::acquire( largeint want , largeint & cap )
     cursor[c] = p;
     left[c]   = slab;
 
-    next_slab[c] = (slab<SLAB_MAX) ? slab*2 : SLAB_MAX;
+    next_slab[c] = (slab<slab_max) ? slab*2 : slab_max;
   }
 
   AdjEntry * p = cursor[c];

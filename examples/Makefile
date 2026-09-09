@@ -15,7 +15,7 @@ EXAMPLES_ALL := $(sort $(patsubst %/,%,$(dir $(wildcard */Makefile))))
 # first when present.  invariants leads: it is the one that says whether the
 # library still computes the same thing, so a failure there explains the rest.
 # Everything else keeps alphabetical order.
-FAST         := invariants fdcheck regress
+FAST         := invariants fdcheck regress nobreak budget
 # $(filter) would return them in EXAMPLES_ALL's (alphabetical) order, not in
 # FAST's, so walk FAST explicitly to keep the order written above.
 EXAMPLES     := $(foreach f,$(FAST),$(filter $(f),$(EXAMPLES_ALL))) $(filter-out $(FAST),$(EXAMPLES_ALL))

@@ -89,8 +89,19 @@ private:
    * in a class at roughly what that class actually uses, so lightly-used classes
    * cost almost nothing and heavily-used ones still amortise.
    */
+  /*
+   * SVEGP-31 : the ceiling follows the budget too.
+   *
+   * SLAB_CAP is what SLAB_MAX used to be, and it is now only an upper bound.
+   * Twenty-two size classes each allowed to grow to 4096 entries is 64 kB per
+   * class, so a handful of busy classes put a couple of hundred kilobytes of
+   * capacity under the tape whatever the budget said -- the other half of the
+   * floor the edge block was holding up.
+   */
   static const largeint SLAB_MIN = 32;
-  static const largeint SLAB_MAX = 4096;
+  static const largeint SLAB_CAP = 4096;
+
+  largeint slab_max;//per-class ceiling, set from the budget
 
   std::vector<AdjEntry*> slabs;               //every allocation, freed at clear()
   std::vector<AdjEntry*> recycled[NCLASS];    //blocks handed back, per class
@@ -112,6 +123,12 @@ public:
 
   AdjArena();
   ~AdjArena();
+
+  /*
+   * Sized from the tape's per-partition budget by Process::initialize(),
+   * before a single adjacency block exists.
+   */
+  void set_budget( largeint bytes );
 
   //hands back a block of at least want entries; cap is what it actually holds
   AdjEntry * acquire( largeint want , largeint & cap );

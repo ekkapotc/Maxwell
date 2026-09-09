@@ -361,6 +361,16 @@ void maxwell::set_elim_mode( elim_t mode )
   }
 }
 
+//SVEGP-32
+void maxwell::set_break_mode( break_t mode )
+{
+  TapeState * tp = current_tape();
+  Process * myProc = tp ? &tp->proc : NULL;
+  if(myProc){
+    myProc->set_break_mode(mode);
+  }
+}
+
 //SVEGP-22
 largeint maxwell::get_partitions()
 {
@@ -979,4 +989,12 @@ void maxwell::Tape::set_elim_mode( elim_t mode )
   Scope s(*this);
 
   maxwell::set_elim_mode(mode);
+}
+
+//SVEGP-32
+void maxwell::Tape::set_break_mode( break_t mode )
+{
+  Scope s(*this);
+
+  maxwell::set_break_mode(mode);
 }

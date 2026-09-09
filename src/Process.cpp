@@ -43,6 +43,7 @@ static const largeint EDGE_BYTES   = sizeof(Edge) + 2*sizeof(AdjEntry);
  */
 Process::Process():
 elim_mode(REVERSE_ELIM),//SVEGP-23
+break_mode(BREAK_ON_TARGET),//SVEGP-32: what the library has always done
 profiling(true),
 throwable(false),
 //unwinding(false),
@@ -252,7 +253,23 @@ void Process::check_memory()
 
         intmed_vec.clear();//clear intmed_vec
         
-        if(throwable){//not throwable on first run
+        /*
+         * SVEGP-32 : the target partition is recorded and merged, so this pass
+         * has nothing left to do.  BREAK_ON_TARGET abandons the rest of it;
+         * RUN_TO_END returns and lets the section finish on its own.
+         *
+         * Falling through is safe, and is not a new code path.  tgt_owner_idx
+         * has just been decremented and next_owner_idx is incremented below,
+         * so the two diverge by two and is_proc() cannot become true again
+         * before reinitialize() resets them.  Every partition after this one
+         * therefore executes exactly as the ones BEFORE the target already do
+         * on every pass: the counters advance so the boundaries stay put,
+         * vertex_on_lhs() returns NULL, and nothing is allocated.  The first
+         * productive pass has always ended this way -- reinitialize() leaves
+         * throwable false for it -- so the no-throw ending is the older of the
+         * two, not the new one.
+         */
+        if(throwable && break_mode==BREAK_ON_TARGET){//not throwable on first run
           //unwinding = true;
           throw BreakException();
         }
@@ -304,6 +321,16 @@ void Process::initialize( largeint indep_count , largeint dep_count , largeint m
     this->indep_count = indep_count;
     this->dep_count = dep_count;
     this->mem_size = mem_size;
+
+    /*
+     * SVEGP-31 : the arenas are told the budget before anything is recorded.
+     * They are the only two places where the library claims storage in units
+     * unrelated to the budget, and until they were told, a tight budget could
+     * not actually make the process small: the graph obeyed the budget and the
+     * arena capacity under it did not.
+     */
+    this->edge_arena.set_budget(mem_size);
+    this->adj_arena.set_budget(mem_size);
   }
 }
 
@@ -658,6 +685,12 @@ void Process::destructor( const active & , bool )
 void Process::set_elim_mode( elim_t mode )
 {
   elim_mode = mode;
+}
+
+//SVEGP-32
+void Process::set_break_mode( break_t mode )
+{
+  break_mode = mode;
 }
 
 largeint Process::eliminate()
