@@ -340,6 +340,17 @@ double maxwell::get_cpu_time()
   return (double)clock()/CLOCKS_PER_SEC;
 }
 
+largeint maxwell::get_stale_reads()
+{
+  TapeState * tp = current_tape();
+  Process * myProc = tp ? &tp->proc : nullptr;
+  if(myProc){
+    return myProc->get_stale_reads();
+  }
+
+  return 0;
+}
+
 largeint maxwell::get_cost()
 {
   TapeState * tp = current_tape();
@@ -604,12 +615,20 @@ void maxwell::internals::restore_values( active * x , active & y )
   TapeState * tp = current_tape();
 
   if(!tp) return;//only reached via checkpoint(), which has already checked
+  /*
+   * The pass boundary.  Everything restored below belongs to the new pass;
+   * everything NOT restored below does not, and active::gen is how the library
+   * can tell the difference instead of dereferencing a freed vertex.
+   */
+  const largeint g = tp->proc.advance_pass();
+
   //y should be reinitialized before x because y could use the same program variable as one of x
   y.reachable = false;
   y.idx = 0;
   y.owner_idx = 0;
   y.val = 0.0;
   y.vtx = nullptr;
+  y.gen = g;
 
   for( largeint i=0 ; i<tp->independent_size ; i++ ){
     x[i].reachable = true;
@@ -617,6 +636,7 @@ void maxwell::internals::restore_values( active * x , active & y )
     x[i].owner_idx = 0;
     x[i].val = tp->indep_shadow_copy[i];
     x[i].vtx = nullptr;
+    x[i].gen = g;
   }
 }
 
@@ -625,6 +645,13 @@ void maxwell::internals::restore_values( active * x , active * y )
   TapeState * tp = current_tape();
 
   if(!tp) return;//only reached via checkpoint(), which has already checked
+  /*
+   * The pass boundary.  Everything restored below belongs to the new pass;
+   * everything NOT restored below does not, and active::gen is how the library
+   * can tell the difference instead of dereferencing a freed vertex.
+   */
+  const largeint g = tp->proc.advance_pass();
+
   if(x!=y || tp->independent_size!=tp->dependent_size)
   {
     for( largeint i=0 ; i<tp->dependent_size ; i++ ){
@@ -633,6 +660,7 @@ void maxwell::internals::restore_values( active * x , active * y )
       y[i].owner_idx = 0;
       y[i].val = 0.0;
       y[i].vtx = nullptr;
+      y[i].gen = g;
     }
   }
 
@@ -642,6 +670,7 @@ void maxwell::internals::restore_values( active * x , active * y )
     x[i].owner_idx = 0;
     x[i].val = tp->indep_shadow_copy[i];
     x[i].vtx = nullptr;
+    x[i].gen = g;
   }
 }
 
@@ -650,6 +679,13 @@ void maxwell::internals::restore_values( active ** x , active ** y )
   TapeState * tp = current_tape();
 
   if(!tp) return;//only reached via checkpoint(), which has already checked
+  /*
+   * The pass boundary.  Everything restored below belongs to the new pass;
+   * everything NOT restored below does not, and active::gen is how the library
+   * can tell the difference instead of dereferencing a freed vertex.
+   */
+  const largeint g = tp->proc.advance_pass();
+
   for( largeint i=0 ; i<tp->dep_y_dim ; i++ ){
     for( largeint j=0 ; j<tp->dep_x_dim ; j++ ){
       y[i][j].reachable = false;
@@ -657,6 +693,7 @@ void maxwell::internals::restore_values( active ** x , active ** y )
       y[i][j].owner_idx = 0;
       y[i][j].val = 0.0;
       y[i][j].vtx = nullptr;
+      y[i][j].gen = g;
     }
   }
 
@@ -673,6 +710,7 @@ void maxwell::internals::restore_values( active ** x , active ** y )
       x[i][j].owner_idx = 0;
       x[i][j].val = tp->indep_shadow_copy[tp->indep_x_dim*i+j];
       x[i][j].vtx = nullptr;
+      x[i][j].gen = g;
     }
   }
 }
@@ -954,6 +992,13 @@ largeint maxwell::Tape::partitions()
   Scope s(*this);
 
   return maxwell::get_partitions();
+}
+
+largeint maxwell::Tape::stale_reads()
+{
+  Scope s(*this);
+
+  return maxwell::get_stale_reads();
 }
 
 largeint maxwell::Tape::cost()

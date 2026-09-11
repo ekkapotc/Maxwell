@@ -62,6 +62,14 @@ namespace maxwell
   largeint get_partitions();
 
   /*
+   * How many times the section read an active that did not survive
+   * checkpoint().  Nonzero means the gradient is wrong and the library said so
+   * on stderr; see active::gen.  Zero is the normal state and the assertion a
+   * test should make.
+   */
+  largeint get_stale_reads();
+
+  /*
    * SVEGP-23 : choose the elimination direction.  Must be called AFTER
    * initialize() and before the checkpoint loop, because finalize() destroys
    * the Process that holds the setting; the default is REVERSE_ELIM.  Both

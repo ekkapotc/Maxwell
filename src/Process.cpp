@@ -57,7 +57,9 @@ indep_count(0),
 intmed_count(0),
 dep_count(0),
 edge_count(0),
-elim_cost(0)
+elim_cost(0),
+pass_gen(1),
+stale_reads(0)
 {
 }
 
@@ -112,8 +114,82 @@ void Process::destroy_graph()
   adj_arena.clear();//SVEGP-30
 }
 
+/*
+ * THE CHECKPOINT CONTRACT, ENFORCED.
+ *
+ * checkpoint() restores the independents and the dependents and frees the
+ * whole graph.  Every other active keeps an idx and a vtx naming vertices that
+ * were destroyed, and the new pass renumbers from the same base, so a stale
+ * idx can even collide with a live one.  Before this, reading such an active
+ * spliced a freed node into the new graph: undefined behaviour, and in the
+ * cases that did not crash the derivative silently came out zero.
+ *
+ * A generation stamp settles it.  Anything whose stamp is out of date did not
+ * survive the checkpoint, so the library drops what it held instead of
+ * following it.
+ */
+bool Process::stale( const active & x ) const
+{
+  return x.gen != pass_gen;
+}
+
+void Process::adopt( const active & x ) const
+{
+  x.gen     = pass_gen;
+  x.idx     = 0;
+  x.old_idx = 0;
+  x.vtx     = nullptr;
+}
+
+largeint Process::advance_pass()
+{
+  return ++pass_gen;
+}
+
+largeint Process::generation() const
+{
+  return pass_gen;
+}
+
+largeint Process::get_stale_reads() const
+{
+  return stale_reads;
+}
+
+/*
+ * Once, not once per operator: a section that does this does it thousands of
+ * times, and the first message is the one that tells you where to look.  The
+ * count is readable with get_stale_reads() so a test can assert it.
+ */
+void Process::report_stale_read()
+{
+  if(!stale_reads){
+    std::cerr <<
+      "maxwell: an active that did not survive checkpoint() has been read.\n"
+      "         Only the independents and the dependents handed to checkpoint()\n"
+      "         are restored between passes; everything else is left pointing at\n"
+      "         a graph that has been freed.  It is being treated as a constant,\n"
+      "         so any derivative that flows through it will be WRONG.\n"
+      "         Build the section's own variables inside the section.\n"
+      "         (reported once; see get_stale_reads() for the count)\n";
+  }
+  stale_reads++;
+}
+
 Vertex * Process::vertex_on_rhs( const active & x )
 {
+  /*
+   * A READ.  This is the one that was silently wrong, so it is the one that
+   * reports.  nullptr means "no vertex": add_edge() already drops a null
+   * operand, so the stale value is used as a constant and contributes no
+   * derivative -- which is what it was doing anyway, now defined and audible.
+   */
+  if( stale(x) ){
+    report_stale_read();
+    adopt(x);
+    return nullptr;
+  }
+
   if(is_proc()){
     if(x.owner_idx==next_owner_idx){
       return x.vtx;
@@ -139,6 +215,8 @@ Vertex * Process::vertex_on_rhs( const active & x )
 
 Vertex * Process::vertex_on_lhs( const active & x )
 {
+  x.gen = pass_gen;//a write: this active now belongs to this pass
+
   intmed_count++;
  
   if(is_proc()){
@@ -158,6 +236,17 @@ Vertex * Process::vertex_on_lhs( const active & x )
 
 Vertex * Process::set_vertex_dead( const active & x )
 {
+  /*
+   * A WRITE.  Overwriting an active that did not survive the checkpoint is not
+   * an error -- it is how a scratch variable declared outside the section gets
+   * reused -- but the vertex it used to name is gone.  Drop it.  This is the
+   * path that dereferenced freed memory.
+   */
+  if( stale(x) ){
+    adopt(x);
+    return nullptr;
+  }
+
   if(is_proc()){
     if(x.idx){ 
       if(x.vtx){
@@ -188,6 +277,11 @@ Vertex * Process::set_vertex_dead( const active & x )
 
 Vertex * Process::set_vertex_dead_binary_op_ass( const active & x )
 {
+  if( stale(x) ){//see set_vertex_dead()
+    adopt(x);
+    return nullptr;
+  }
+
   if(is_proc()){
     if(x.idx){ 
       if(x.vtx){
@@ -398,6 +492,7 @@ void Process::finalize()
 void Process::register_indep_vertex( const active & x )
 {
   if(profiling){
+    x.gen = pass_gen;//an independent belongs to every pass; restore_values re-stamps it
     x.reachable = true;
     x.idx = next_vertex_idx;
 

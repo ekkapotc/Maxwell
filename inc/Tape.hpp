@@ -200,6 +200,8 @@ public:
   //how many partitions the tape was broken into; 1 means it never chunked
   largeint partitions();
 
+  largeint stale_reads();
+
   largeint cost();
 
   //the graph's payload in bytes, by the same accounting the budget is spent

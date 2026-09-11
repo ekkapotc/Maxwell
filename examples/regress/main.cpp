@@ -825,6 +825,78 @@ static void t_raii()
   }
 }
 
+
+/* ------------------------------------------------------------------ 33 ---
+ *
+ * AN active THAT DID NOT SURVIVE checkpoint().
+ *
+ * Found by chunking Boltzmann's pde example, which built its Crank-Nicholson
+ * solver -- and therefore its active work arrays -- once, outside the
+ * checkpoint loop.  Safe for as long as the example never chunked; give it a
+ * budget that breaks the tape and the arrays outlive a partition boundary,
+ * are read on the next pass, and splice a freed vertex into the new graph.
+ *
+ * The shape below is the same mistake without the arrays, and it is the
+ * dangerous one: nothing crashes, nothing is corrupted, the derivative is
+ * simply ZERO instead of 1.0001^400. Two programs that differ only in where
+ * one active is declared.
+ *
+ * The library now stamps every active with the pass that recorded it
+ * (active::gen) and re-stamps the independents and dependents in
+ * restore_values(). A read of an out-of-date active is reported on stderr,
+ * counted, and treated as a constant rather than dereferenced.
+ */
+static double stale_case( bool outside , unsigned long * reads )
+{
+  double x0[1] = { 1.0 };
+
+  Tape t(1,1,4000);
+  active * x = t.independents(x0);
+  active y, carry;
+  int pass = 0;
+
+  t.run( y , [&]{
+    active u = x[0], local;
+    if(outside){ if(pass==0) carry = u*2.0; }
+    else       { local = u*2.0; }
+    for(int i=0;i<400;i++) u = u*1.0001 + 0.5;
+    active z = (outside ? carry : local) + u;
+    y = u;
+    (void)z;
+    pass++;
+  });
+
+  t.dependents(&y);
+  Jacobian J = t.harvest();
+  *reads = (unsigned long)t.stale_reads();
+  return J(0,0);
+}
+
+static void t_stale_active()
+{
+  std::printf("a non-independent active that outlives a pass is caught, not followed\n");
+
+  const double exact = std::pow(1.0001,400.0);
+
+  unsigned long r_in = 99, r_out = 0;
+  const double in  = stale_case(false,&r_in);
+
+  report("declared inside the section: the derivative is right",
+         std::fabs(in-exact) <= 1e-9*exact);
+  report("declared inside the section: nothing is reported",
+         r_in==0);
+
+  std::fprintf(stderr,"  (the next stderr block is this test provoking the diagnostic)\n");
+  const double out = stale_case(true,&r_out);
+
+  report("declared outside: the stale read is counted, not dereferenced",
+         r_out>0);
+  report("declared outside: the tape still finishes and harvests",
+         out==out);/* not NaN: the run completed */
+  report("get_stale_reads() is 0 for a clean tape and nonzero for a dirty one",
+         r_in==0 && r_out>0);
+}
+
 /* ---------------------------------------------------------------------- */
 int main()
 {
@@ -838,6 +910,7 @@ int main()
   t_budget();  std::printf("\n");
   t_elim();    std::printf("\n");
   t_raii();    std::printf("\n");   // last: uses jac() as its reference
+  t_stale_active(); std::printf("\n");
 
   std::printf("======================\n%s: %d failure(s)\n",
               failures?"FAIL":"PASS", failures);

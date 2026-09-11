@@ -132,6 +132,22 @@ public:
   mutable largeint old_idx;
   mutable double val;
   mutable internals::Vertex * vtx;
+
+  /*
+   * WHICH PASS THIS active BELONGS TO.
+   *
+   * checkpoint() restores the independents and the dependents and frees the
+   * whole graph; every other active is left holding idx and vtx that name
+   * vertices which no longer exist.  Reading one used to splice a freed node
+   * into the new graph -- silently, and the derivative came out zero.
+   *
+   * Process stamps this field whenever it gives an active a vertex, and
+   * restore_values() re-stamps the independents and dependents at the top of
+   * every pass.  Anything whose stamp is out of date did not survive the
+   * checkpoint, and the library can say so instead of dereferencing it.
+   * 0 is "never recorded", which is what a freshly constructed active is.
+   */
+  mutable largeint gen;
 		
 public:		
 

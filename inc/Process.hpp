@@ -43,15 +43,36 @@ private:
   largeint dep_count;
   largeint edge_count;
   largeint elim_cost;
+
+  //the pass an active must carry to be usable; see active::gen
+  largeint pass_gen;
+  largeint stale_reads;
  
   std::vector<Vertex*> intmed_vec;
   std::vector<Vertex*> dep_vec;
 
   std::map<largeint,Vertex*> intmed_map;
 
+private:
+
+  /* True when x was recorded in an earlier pass (or never), so its idx and
+   * vtx name vertices that no longer exist. */
+  bool stale( const active & x ) const;
+
+  /* Make x belong to this pass, forgetting whatever it held.  Safe: it drops
+   * the pointer rather than following it. */
+  void adopt( const active & x ) const;
+
+  void report_stale_read();
+
 public:
 
   Process();
+
+  /* Called once per pass by restore_values(), before anything is recorded. */
+  largeint advance_pass();
+  largeint generation() const;
+  largeint get_stale_reads() const;
 
   /*
    * SVEGP-27 : a Process owns every Vertex in intmed_map/intmed_vec and the

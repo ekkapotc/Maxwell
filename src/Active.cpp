@@ -21,7 +21,8 @@ idx(0),
 owner_idx(0),
 old_idx(0),
 val(0),
-vtx(nullptr)
+vtx(nullptr),
+gen(0)
 { 
 }
 
@@ -31,7 +32,8 @@ idx(0),
 owner_idx(0),
 old_idx(0),
 val(a),
-vtx(nullptr)
+vtx(nullptr),
+gen(0)
 {
 }
 
@@ -41,7 +43,8 @@ idx(0),
 owner_idx(0),
 old_idx(0),
 val(x.val),
-vtx(nullptr)
+vtx(nullptr),
+gen(0)
 {
   unary_op( x , 1.0 , *this , false );//overwrite=false,temp=false
 }
